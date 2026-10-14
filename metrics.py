@@ -1,141 +1,20 @@
-"""Evaluation metrics for Video Captioning.
+"""Standard COCO caption evaluation metrics for Video Captioning.
 
-Computes:
-- BLEU-1, BLEU-2, BLEU-3, BLEU-4 (via corpus_bleu with smoothing)
-- METEOR (via nltk.translate.meteor_score)
-- ROUGE-L (Longest Common Subsequence F-measure)
-- CIDEr (Consensus-based Image Description Evaluation via TF-IDF n-grams)
-- Distinct-1, Distinct-2 (n-gram diversity)
-- Repetition metrics (repeated bigram/trigram caption rates)
+Uses pycocoevalcap (Bleu-1..4, METEOR, ROUGE-L, CIDEr) with PTBTokenizer.
+Legacy custom metric implementations are in metrics_legacy.py.
 """
 
 import math
 import re
+import shutil
 from collections import Counter
 import numpy as np
-from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
-from nltk.translate.meteor_score import meteor_score
 
 TOKEN_PATTERN = re.compile(r"\w+|[^\w\s]", re.UNICODE)
 
 
 def tokenize(text):
     return TOKEN_PATTERN.findall(text.lower())
-
-
-def lcs(seq1, seq2):
-    """Compute length of Longest Common Subsequence between seq1 and seq2."""
-    m, n = len(seq1), len(seq2)
-    if m == 0 or n == 0:
-        return 0
-    dp = [0] * (n + 1)
-    for elem1 in seq1:
-        prev = 0
-        for j, elem2 in enumerate(seq2):
-            temp = dp[j + 1]
-            if elem1 == elem2:
-                dp[j + 1] = prev + 1
-            else:
-                dp[j + 1] = max(dp[j + 1], dp[j])
-            prev = temp
-    return dp[n]
-
-
-def sentence_rouge_l(candidate_tokens, reference_tokens_list, beta=1.2):
-    """Compute multi-reference ROUGE-L score for a candidate against a list of references."""
-    if not candidate_tokens:
-        return 0.0
-
-    c_len = len(candidate_tokens)
-    best_f1 = 0.0
-
-    for ref in reference_tokens_list:
-        r_len = len(ref)
-        if r_len == 0:
-            continue
-        lcs_len = lcs(candidate_tokens, ref)
-        if lcs_len == 0:
-            continue
-        prec = lcs_len / c_len
-        rec = lcs_len / r_len
-        denom = rec + (beta ** 2) * prec
-        if denom > 0:
-            f1 = ((1 + beta ** 2) * prec * rec) / denom
-            if f1 > best_f1:
-                best_f1 = f1
-
-    return best_f1
-
-
-class CIDErScorer:
-    """Computes CIDEr score (Vedantam et al., CVPR 2015) for video captioning."""
-
-    def __init__(self, references_list, n=4, sigma=6.0):
-        self.n = n
-        self.sigma = sigma
-        self.ref_len = len(references_list)
-        self.doc_freq = [Counter() for _ in range(n)]
-
-        # references_list: list of lists of tokenized references
-        for refs in references_list:
-            seen_ngrams = [set() for _ in range(n)]
-            for ref in refs:
-                for k in range(1, n + 1):
-                    for i in range(len(ref) - k + 1):
-                        seen_ngrams[k - 1].add(tuple(ref[i:i + k]))
-            for k in range(n):
-                for ngram in seen_ngrams[k]:
-                    self.doc_freq[k][ngram] += 1
-
-    def _get_tfidf_vector(self, tokens, k):
-        counts = Counter(
-            tuple(tokens[i:i + k])
-            for i in range(len(tokens) - k + 1)
-        )
-        total = sum(counts.values())
-        if total == 0:
-            return {}
-
-        vec = {}
-        for ngram, count in counts.items():
-            df = self.doc_freq[k - 1].get(ngram, 0)
-            # Standard smoothed IDF
-            idf = math.log(max(1.0, self.ref_len / (df + 1e-8)))
-            vec[ngram] = (count / total) * idf
-        return vec
-
-    def _cosine_similarity(self, vec1, vec2):
-        if not vec1 or not vec2:
-            return 0.0
-        dot = sum(v * vec2.get(k, 0.0) for k, v in vec1.items())
-        norm1 = math.sqrt(sum(v * v for v in vec1.values()))
-        norm2 = math.sqrt(sum(v * v for v in vec2.values()))
-        if norm1 <= 0 or norm2 <= 0:
-            return 0.0
-        return dot / (norm1 * norm2)
-
-    def score(self, hypothesis_tokens, reference_tokens_list):
-        if not hypothesis_tokens or not reference_tokens_list:
-            return 0.0
-
-        scores_by_n = []
-        hyp_len = len(hypothesis_tokens)
-
-        # Average reference length for Gaussian penalty
-        ref_lens = [len(r) for r in reference_tokens_list if len(r) > 0]
-        ref_len_mean = np.mean(ref_lens) if ref_lens else 1.0
-
-        for k in range(1, self.n + 1):
-            hyp_vec = self._get_tfidf_vector(hypothesis_tokens, k)
-            sims = [
-                self._cosine_similarity(hyp_vec, self._get_tfidf_vector(ref, k))
-                for ref in reference_tokens_list
-            ]
-            scores_by_n.append(np.mean(sims) if sims else 0.0)
-
-        # Gaussian penalty for length mismatch
-        length_penalty = math.exp(-((hyp_len - ref_len_mean) ** 2) / (2 * self.sigma ** 2))
-        return 10.0 * float(np.mean(scores_by_n)) * length_penalty
 
 
 def ngram_counts(tokens, n):
@@ -146,6 +25,7 @@ def ngram_counts(tokens, n):
 
 
 def caption_statistics(captions):
+    """Computes diversity and repetition statistics across generated captions."""
     total_tokens = 0
     unique_tokens = set()
     ngram_totals = {1: 0, 2: 0}
@@ -191,61 +71,113 @@ def caption_statistics(captions):
     }
 
 
-def compute_all_metrics(records, predictions):
-    """Computes BLEU (1-4), METEOR, ROUGE-L, CIDEr, and caption statistics."""
-    tokenized_refs = [
-        [tokenize(ref) for ref in (record.get("references") or record.get("caption") or [])]
-        for record in records
-    ]
-    tokenized_hyps = [tokenize(pred) for pred in predictions]
+def evaluate_predictions(refs, hyps):
+    """Evaluate candidate captions against reference captions using standard COCO metrics.
 
-    smoother = SmoothingFunction().method1
-    results = {}
+    Args:
+        refs: dict mapping video_id to list of raw reference strings, e.g. {vid: [ref1, ref2, ...]}
+        hyps: dict mapping video_id to single raw hypothesis string, e.g. {vid: hyp}
 
-    # 1. BLEU 1-4
-    for n in range(1, 5):
-        weights = tuple([1.0 / n] * n + [0.0] * (4 - n))
-        results[f"BLEU-{n}"] = round(
-            float(
-                corpus_bleu(
-                    tokenized_refs,
-                    tokenized_hyps,
-                    weights=weights,
-                    smoothing_function=smoother,
-                )
-            ),
-            4,
+    Returns:
+        dict containing:
+            BLEU-1, BLEU-2, BLEU-3, BLEU-4, METEOR, ROUGE-L, CIDEr (scaled x100, rounded to 2 decimals)
+            "scale": "x100"
+            "per_video": dict mapping video_id to per-video metric dict
+    """
+    if not shutil.which("java"):
+        raise RuntimeError(
+            "Java is required for pycocoevalcap standard evaluation but 'java' was not found in PATH."
         )
 
-    # 2. METEOR
-    meteor_scores = []
-    for refs, hyp in zip(tokenized_refs, tokenized_hyps):
-        try:
-            meteor_scores.append(meteor_score(refs, hyp))
-        except LookupError:
-            meteor_scores = []
-            break
-    if meteor_scores:
-        results["METEOR"] = round(float(np.mean(meteor_scores)), 4)
-    else:
-        results["METEOR"] = None
+    if set(refs.keys()) != set(hyps.keys()):
+        raise ValueError(
+            f"Video ID mismatch between references ({len(refs)}) and hypotheses ({len(hyps)})."
+        )
 
-    # 3. ROUGE-L
-    rouge_l_scores = [
-        sentence_rouge_l(hyp, refs)
-        for hyp, refs in zip(tokenized_hyps, tokenized_refs)
+    video_ids = list(hyps.keys())
+    if not video_ids:
+        return {
+            "BLEU-1": 0.0,
+            "BLEU-2": 0.0,
+            "BLEU-3": 0.0,
+            "BLEU-4": 0.0,
+            "METEOR": 0.0,
+            "ROUGE-L": 0.0,
+            "CIDEr": 0.0,
+            "scale": "x100",
+            "per_video": {},
+        }
+
+    from pycocoevalcap.tokenizer.ptbtokenizer import PTBTokenizer
+    from pycocoevalcap.bleu.bleu import Bleu
+    from pycocoevalcap.meteor.meteor import Meteor
+    from pycocoevalcap.rouge.rouge import Rouge
+    from pycocoevalcap.cider.cider import Cider
+
+    refs_formatted = {
+        vid: [{"caption": str(cap)} for cap in refs[vid]]
+        for vid in video_ids
+    }
+    hyps_formatted = {
+        vid: [{"caption": str(hyps[vid]) if hyps[vid] is not None else ""}]
+        for vid in video_ids
+    }
+
+    tokenizer = PTBTokenizer()
+    refs_tok = tokenizer.tokenize(refs_formatted)
+    hyps_tok = tokenizer.tokenize(hyps_formatted)
+
+    # Ensure all video IDs are preserved even if hypothesis or reference was blank
+    for vid in video_ids:
+        if vid not in refs_tok or not refs_tok[vid]:
+            refs_tok[vid] = [""]
+        if vid not in hyps_tok or not hyps_tok[vid]:
+            hyps_tok[vid] = [""]
+
+    scorers = [
+        (Bleu(4), ["BLEU-1", "BLEU-2", "BLEU-3", "BLEU-4"]),
+        (Meteor(), "METEOR"),
+        (Rouge(), "ROUGE-L"),
+        (Cider(), "CIDEr"),
     ]
-    results["ROUGE-L"] = round(float(np.mean(rouge_l_scores)), 4)
 
-    # 4. CIDEr
-    cider_scorer = CIDErScorer(tokenized_refs)
-    cider_scores = [
-        cider_scorer.score(hyp, refs)
-        for hyp, refs in zip(tokenized_hyps, tokenized_refs)
-    ]
-    results["CIDEr"] = round(float(np.mean(cider_scores)), 4)
+    overall_results = {"scale": "x100"}
+    per_video = {vid: {} for vid in video_ids}
 
-    # 5. Caption diversity and statistics
+    for scorer, method in scorers:
+        score, scores = scorer.compute_score(refs_tok, hyps_tok)
+        if isinstance(method, list):
+            for n, m_name in enumerate(method):
+                overall_results[m_name] = round(float(score[n]) * 100.0, 2)
+                for idx, vid in enumerate(video_ids):
+                    per_video[vid][m_name] = round(float(scores[n][idx]) * 100.0, 2)
+        else:
+            overall_results[method] = round(float(score) * 100.0, 2)
+            for idx, vid in enumerate(video_ids):
+                per_video[vid][method] = round(float(scores[idx]) * 100.0, 2)
+
+    overall_results["per_video"] = per_video
+    return overall_results
+
+
+def compute_all_metrics(records, predictions):
+    """Computes BLEU (1-4), METEOR, ROUGE-L, CIDEr, and caption diversity statistics.
+
+    Maintains backwards compatibility by taking records list and predictions list,
+    delegating to evaluate_predictions and appending diversity statistics.
+    """
+    refs = {}
+    hyps = {}
+
+    for idx, record in enumerate(records):
+        vid = record.get("video_id", str(idx))
+        ref_list = record.get("references") or record.get("caption") or []
+        refs[vid] = ref_list
+        hyps[vid] = predictions[idx] if idx < len(predictions) else ""
+
+    results = evaluate_predictions(refs, hyps)
+
+    # Add diversity and repetition statistics
     results.update(caption_statistics(predictions))
 
     return results

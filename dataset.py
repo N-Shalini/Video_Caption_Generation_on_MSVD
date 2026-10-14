@@ -57,6 +57,7 @@ class MSVDDataset(Dataset):
         vocab_path=VOCAB_PATH,
         max_caption_length=MAX_CAPTION_LENGTH,
         captions_per_video=1,
+        seed=42,
     ):
         if split not in {"train", "val", "test"}:
             raise ValueError(
@@ -68,13 +69,17 @@ class MSVDDataset(Dataset):
                 "max_caption_length must allow BOS and EOS"
             )
 
+        if int(captions_per_video) < 0:
+            raise ValueError("captions_per_video must be >= 0 (0 means all captions)")
+
         if annotation_path is None:
             annotation_path = ANNOTATION_DIR / f"msvd_{split}.json"
 
         self.split = split
         self.feature_dir = Path(feature_dir)
         self.max_caption_length = max_caption_length
-        self.captions_per_video = max(1, int(captions_per_video))
+        self.captions_per_video = int(captions_per_video)
+        self.seed = int(seed)
         self.vocab = load_vocab(vocab_path)
 
         self.pad_idx = self.vocab["<pad>"]
@@ -128,17 +133,45 @@ class MSVDDataset(Dataset):
 
         self.video_ids = [record["video_id"] for record in self.records]
 
-        # Multi-caption expansion for training
-        if self.split == "train" and self.captions_per_video > 1:
+        # Multi-caption setup
+        if self.split == "train":
             self.samples = []
-            for record in self.records:
-                caps = record["caption"]
-                # Take up to captions_per_video distinct references
-                k = min(self.captions_per_video, len(caps))
-                for cap in caps[:k]:
-                    self.samples.append((record, cap))
+            self.resample(epoch=0)
+        elif self.split == "val":
+            if self.captions_per_video == 0:
+                # All reference captions for complete validation loss
+                self.samples = [
+                    (record, cap)
+                    for record in self.records
+                    for cap in record["caption"]
+                ]
+            else:
+                self.samples = [
+                    (record, cap)
+                    for record in self.records
+                    for cap in record["caption"][:self.captions_per_video]
+                ]
         else:
             self.samples = None
+
+    def resample(self, epoch):
+        """Resample captions per video for training using a dedicated deterministic RNG."""
+        if self.split != "train":
+            return
+
+        rng = random.Random(self.seed * 1000003 + epoch)
+        self.samples = []
+
+        for record in self.records:
+            caps = record["caption"]
+            if self.captions_per_video == 0:
+                for cap in caps:
+                    self.samples.append((record, cap))
+            else:
+                sample_k = min(self.captions_per_video, len(caps))
+                sampled_caps = rng.sample(caps, sample_k)
+                for cap in sampled_caps:
+                    self.samples.append((record, cap))
 
     def __len__(self):
         if self.samples is not None:
@@ -172,15 +205,7 @@ class MSVDDataset(Dataset):
             caption_ids = self.encode_caption(selected_caption)
         else:
             record = self.records[index]
-            if self.split == "train":
-                selected_caption = random.choice(record["caption"])
-                caption_ids = self.encode_caption(selected_caption)
-            elif self.split == "val":
-                # Fixed reference for reproducible validation loss.
-                selected_caption = record["caption"][0]
-                caption_ids = self.encode_caption(selected_caption)
-            else:
-                caption_ids = torch.empty(0, dtype=torch.long)
+            caption_ids = torch.empty(0, dtype=torch.long)
 
         video_id = record["video_id"]
         feature_path = self.feature_dir / f"{video_id}.npy"

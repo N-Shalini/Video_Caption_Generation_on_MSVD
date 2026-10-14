@@ -1,211 +1,335 @@
+import argparse
 import json
+import sys
 import time
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from model import VideoCaptionModel
-from generate_caption import greedy_decode, beam_search_decode
-from metrics import compute_all_metrics
-
+from generate_caption import load_model, greedy_decode, beam_search_decode
+from metrics import evaluate_predictions, caption_statistics
 
 ROOT = Path(__file__).resolve().parent
-CHECKPOINT_PATH = ROOT / "checkpoints" / "temporal_attention_continued_best.pt"
 ANNOTATIONS_PATH = ROOT / "data" / "annotations" / "msvd_test.json"
 FEATURE_DIR = ROOT / "data" / "features" / "vgg16_spatial"
 RESULTS_DIR = ROOT / "results"
+DEFAULT_DECODING_CONFIG = RESULTS_DIR / "decoding_selection.json"
 
 
-import argparse
+def find_default_checkpoint():
+    priority = [
+        ROOT / "checkpoints" / "spatiotemporal_attention_vgg_best.pt",
+        ROOT / "checkpoints" / "temporal_attention_continued_best.pt",
+        ROOT / "checkpoints" / "spatiotemporal_vgg_best.pt",
+        ROOT / "checkpoints" / "best_model.pt",
+    ]
+    for p in priority:
+        if p.is_file():
+            return p
+    return ROOT / "checkpoints" / "temporal_attention_continued_best.pt"
 
-def load_model(device, checkpoint_path=CHECKPOINT_PATH):
-    checkpoint_path = Path(checkpoint_path)
-    if not checkpoint_path.is_file():
-        raise FileNotFoundError(f"Checkpoint not found at: {checkpoint_path}")
 
-    checkpoint = torch.load(
-        checkpoint_path,
-        map_location=device,
-        weights_only=False,
-    )
-    config = checkpoint["config"]
-    vocab = checkpoint["vocab"]
+def decode_one_setting(model, encoded_cache, records, id_to_word, max_length, device, setting, suppress_unk=True):
+    bw = setting.get("beam_width", 1)
+    lp = setting.get("length_penalty", 0.7)
+    rp = setting.get("repetition_penalty", 1.0)
+    nb = setting.get("ngram_block_size", 0)
 
-    encoder_type = config.get("encoder_type", "temporal")
-
-    model = VideoCaptionModel(
-        vocab_size=len(vocab),
-        feature_dim=config["feature_channels"],
-        embed_dim=config["embedding_dim"],
-        hidden_dim=config["hidden_dim"],
-        dropout=config["dropout"],
-        encoder_type=encoder_type,
-    ).to(device)
-
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
-
-    id_to_word = {idx: word for word, idx in vocab.items()}
-    return model, config, id_to_word, checkpoint
+    hyps = {}
+    with torch.inference_mode():
+        for r in records:
+            vid = r["video_id"]
+            enc_out = encoded_cache[vid]
+            if bw == 1:
+                cap, _ = greedy_decode(
+                    model=model,
+                    encoder_out=enc_out,
+                    id_to_word=id_to_word,
+                    max_length=max_length,
+                    device=device,
+                    repetition_penalty=rp,
+                    suppress_unk=suppress_unk,
+                )
+            else:
+                cap, _ = beam_search_decode(
+                    model=model,
+                    encoder_out=enc_out,
+                    id_to_word=id_to_word,
+                    max_length=max_length,
+                    device=device,
+                    beam_width=bw,
+                    length_penalty=lp,
+                    repetition_penalty=rp,
+                    ngram_block_size=nb,
+                    suppress_unk=suppress_unk,
+                )
+            hyps[vid] = cap
+    return hyps
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate video captioning checkpoint on MSVD test set.")
+    parser = argparse.ArgumentParser(
+        description="Evaluate video captioning checkpoint on MSVD test set strictly with a tuned decoding config."
+    )
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default=str(CHECKPOINT_PATH),
-        help=f"Path to checkpoint to evaluate (default: {CHECKPOINT_PATH.name}).",
+        default=str(find_default_checkpoint()),
+        help="Path to checkpoint to evaluate.",
     )
+    parser.add_argument(
+        "--decoding-config",
+        type=str,
+        default=None,
+        help="Path to decoding configuration JSON produced on val set (defaults to results/{checkpoint_stem}_decoding_selection.json or results/decoding_selection.json).",
+    )
+    parser.add_argument(
+        "--annotations",
+        type=str,
+        default=str(ANNOTATIONS_PATH),
+        help="Path to test set annotations JSON.",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Device to use ('cuda', 'cpu', etc.; overrides checkpoint/config).",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for reproducibility.",
+    )
+    parser.add_argument(
+        "--max-test-videos",
+        type=int,
+        default=None,
+        help="Dev/smoke flag: limit number of test videos.",
+    )
+    parser.add_argument(
+        "--no-ablation",
+        action="store_true",
+        help="Skip controlled ablation (greedy vs beam k=3 vs beam k=5).",
+    )
+
     args = parser.parse_args()
 
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    device = torch.device("cpu")
+    checkpoint_path = Path(args.checkpoint)
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Checkpoint not found at: {checkpoint_path}")
 
-    with ANNOTATIONS_PATH.open("r", encoding="utf-8") as file:
-        records = json.load(file)
-
-    eval_checkpoint = Path(args.checkpoint)
-    model, config, id_to_word, checkpoint = load_model(device, checkpoint_path=eval_checkpoint)
-
-    print("=" * 60)
-    print("EVALUATING TEST SET ON MSVD DATASET")
-    print("Checkpoint:", eval_checkpoint.name)
-    print("Epoch:", checkpoint["epoch"])
-    print("Best validation loss:", checkpoint["best_val_loss"])
-    print("Test videos:", len(records))
-    print("=" * 60)
-
-    # Strategy configurations to evaluate:
-    # '1.0' and '1.2' preserve exact backwards compatibility for existing predictions
-    strategies = {
-        "1.0": {"mode": "greedy", "repetition_penalty": 1.0},
-        "1.2": {"mode": "greedy", "repetition_penalty": 1.2},
-        "beam_3": {"mode": "beam", "beam_width": 3, "length_penalty": 0.7, "repetition_penalty": 1.1, "ngram_block_size": 3},
-        "beam_5": {"mode": "beam", "beam_width": 5, "length_penalty": 0.7, "repetition_penalty": 1.2, "ngram_block_size": 3},
-    }
-
-    predictions_by_strategy = {s: [] for s in strategies}
-    output_records = []
-
-    start_time = time.time()
-
-    for index, record in enumerate(records):
-        video_id = record["video_id"]
-        feature_path = FEATURE_DIR / f"{video_id}.npy"
-
-        if not feature_path.is_file():
-            raise FileNotFoundError(f"Missing features for {video_id}: {feature_path}")
-
-        features = np.load(feature_path, allow_pickle=False)
-
-        if features.shape != (8, 512, 7, 7):
-            raise ValueError(f"Unexpected feature shape for {video_id}: {features.shape}")
-
-        if features.dtype != np.float32:
-            raise TypeError(f"Expected float32 features for {video_id}, got {features.dtype}")
-
-        if not np.isfinite(features).all():
-            raise ValueError(f"Non-finite feature values for {video_id}")
-
-        record_predictions = {}
-
-        for strat_name, strat_cfg in strategies.items():
-            if strat_cfg["mode"] == "beam":
-                caption, _ = beam_search_decode(
-                    model=model,
-                    features=features,
-                    id_to_word=id_to_word,
-                    max_length=config["max_caption_length"],
-                    device=device,
-                    beam_width=strat_cfg["beam_width"],
-                    length_penalty=strat_cfg["length_penalty"],
-                    repetition_penalty=strat_cfg["repetition_penalty"],
-                    ngram_block_size=strat_cfg["ngram_block_size"],
-                )
-            else:
-                caption, _ = greedy_decode(
-                    model=model,
-                    features=features,
-                    id_to_word=id_to_word,
-                    max_length=config["max_caption_length"],
-                    device=device,
-                    repetition_penalty=strat_cfg["repetition_penalty"],
-                )
-
-            predictions_by_strategy[strat_name].append(caption)
-            record_predictions[strat_name] = caption
-
-        output_records.append({
-            "video_id": video_id,
-            "references": record["caption"],
-            "predictions": record_predictions,
-        })
-
-        if (index + 1) % 50 == 0 or index + 1 == len(records):
-            elapsed = time.time() - start_time
-            print(f"Processed {index + 1}/{len(records)} videos ({elapsed:.1f}s)")
-
-    print("\nComputing comprehensive evaluation metrics (BLEU, METEOR, ROUGE-L, CIDEr, Diversity)...")
-    comparison = {}
-
-    for strat_name in strategies:
-        comparison[strat_name] = compute_all_metrics(
-            records, predictions_by_strategy[strat_name]
-        )
-
-    if eval_checkpoint.stem == CHECKPOINT_PATH.stem:
-        metrics_path = RESULTS_DIR / "test_set_evaluation.json"
-        captions_path = RESULTS_DIR / "test_set_predictions.json"
+    # Resolve decoding config: prioritize model-specific selection, then default
+    if args.decoding_config is not None:
+        decoding_config_path = Path(args.decoding_config)
     else:
-        metrics_path = RESULTS_DIR / f"{eval_checkpoint.stem}_evaluation.json"
-        captions_path = RESULTS_DIR / f"{eval_checkpoint.stem}_predictions.json"
+        model_specific_config = RESULTS_DIR / f"{checkpoint_path.stem}_decoding_selection.json"
+        if model_specific_config.is_file():
+            decoding_config_path = model_specific_config
+        else:
+            decoding_config_path = DEFAULT_DECODING_CONFIG
 
-    report = {
-        "checkpoint_epoch": checkpoint["epoch"],
-        "checkpoint_file": eval_checkpoint.name,
-        "best_validation_loss": checkpoint["best_val_loss"],
-        "test_video_count": len(records),
-        "strategies": strategies,
-        "evaluation_results": comparison,
-        "notes": [
-            "Evaluated on the latest best model: checkpoints/temporal_attention_continued_best.pt.",
-            "Includes greedy decoding (penalties 1.0, 1.2) and beam search decoding (k=3, k=5).",
-            "CIDEr uses consensus TF-IDF matching across reference n-grams.",
-            "ROUGE-L uses multi-reference LCS F-measure.",
-            "BLEU values use smoothed corpus-level NLTK BLEU.",
-            "Distinct-n measures unique n-grams divided by all n-gram occurrences.",
-            "Unique token count measures the total vocabulary footprint across all 670 generated captions.",
-        ],
-    }
+    # Rule: Refuse to run without valid decoding config
+    if not decoding_config_path.is_file():
+        sys.stderr.write(
+            f"ERROR: Decoding configuration file not found at '{decoding_config_path}'.\n"
+            "evaluate_test_set.py requires --decoding-config (default results/{checkpoint_stem}_decoding_selection.json or results/decoding_selection.json) "
+            "and refuses to run without it to prevent tuning decoding hyperparameters on the TEST set.\n"
+            "Please run tune_decoding.py on the validation set first.\n"
+        )
+        sys.exit(1)
 
-    with metrics_path.open("w", encoding="utf-8") as file:
-        json.dump(report, file, indent=2)
+    with decoding_config_path.open("r", encoding="utf-8") as f:
+        decoding_data = json.load(f)
 
-    with captions_path.open("w", encoding="utf-8") as file:
-        json.dump(output_records, file, indent=2, ensure_ascii=False)
+    chosen_config = decoding_data.get("best_config", decoding_data)
 
-    print("\n" + "=" * 80)
-    print(f"{'Metric':<32} | {'Greedy 1.0':<10} | {'Greedy 1.2':<10} | {'Beam (k=3)':<10} | {'Beam (k=5)':<10}")
-    print("-" * 80)
+    # Resolve device
+    device_arg = None
+    if args.device is not None:
+        dev_str = args.device
+        if dev_str.startswith("cuda") and not torch.cuda.is_available():
+            print(f"Warning: {dev_str} requested but CUDA is not available. Falling back to cpu.")
+            dev_str = "cpu"
+        device_arg = torch.device(dev_str)
 
-    metric_keys = [
-        "BLEU-1", "BLEU-2", "BLEU-3", "BLEU-4", "METEOR", "ROUGE-L", "CIDEr",
-        "distinct_1", "distinct_2", "unique_token_count", "mean_caption_tokens",
-        "repeated_bigram_caption_rate"
+    model, config, vocab, id_to_word, checkpoint = load_model(
+        device=device_arg, checkpoint_path=checkpoint_path
+    )
+    device = next(model.parameters()).device
+    model.eval()
+
+    seed = args.seed if args.seed is not None else config.get("seed", 42)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    print("=" * 70)
+    print("EVALUATING MSVD TEST SET")
+    print(f"Checkpoint: {checkpoint_path.name} | Device: {device}")
+    print(f"Decoding config source: {decoding_config_path}")
+    print(f"Loaded config: beam_width={chosen_config.get('beam_width', 1)}, "
+          f"length_penalty={chosen_config.get('length_penalty', 0.7)}, "
+          f"repetition_penalty={chosen_config.get('repetition_penalty', 1.0)}, "
+          f"ngram_block_size={chosen_config.get('ngram_block_size', 0)}")
+    print("=" * 70)
+
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    with open(args.annotations, "r", encoding="utf-8") as f:
+        records = json.load(f)
+
+    if args.max_test_videos is not None:
+        records = records[: args.max_test_videos]
+
+    total_test = len(records)
+    refs = {r["video_id"]: r["caption"] for r in records}
+
+    # Precompute test video encoder representations
+    encoded_cache = {}
+    print(f"Precomputing encoder features for {total_test} test videos...")
+    start_time = time.time()
+    with torch.inference_mode():
+        for r in records:
+            vid = r["video_id"]
+            feat_file = FEATURE_DIR / f"{vid}.npy"
+            if not feat_file.is_file():
+                raise FileNotFoundError(f"Feature file not found: {feat_file}")
+            feat_np = np.load(feat_file, allow_pickle=False)
+            if feat_np.shape != (8, 512, 7, 7):
+                raise ValueError(f"Unexpected feature shape for {vid}: {feat_np.shape}")
+            if feat_np.dtype != np.float32:
+                raise TypeError(f"Expected float32 features for {vid}, got {feat_np.dtype}")
+            if not np.isfinite(feat_np).all():
+                raise ValueError(f"Non-finite feature values for {vid}")
+            feat_t = torch.from_numpy(feat_np).float().unsqueeze(0).to(device)
+            encoded_cache[vid] = model.encoder(feat_t)
+
+    print(f"Encoder precomputation completed in {time.time() - start_time:.1f}s")
+    max_length = config.get("max_caption_length", 30)
+    suppress_unk = config.get("suppress_unk", True)
+
+    # 1. Evaluate test set ONCE with the chosen configuration
+    print("\nRunning test evaluation with tuned config...")
+    chosen_hyps = decode_one_setting(
+        model=model,
+        encoded_cache=encoded_cache,
+        records=records,
+        id_to_word=id_to_word,
+        max_length=max_length,
+        device=device,
+        setting=chosen_config,
+        suppress_unk=suppress_unk,
+    )
+
+    test_metrics = evaluate_predictions(refs, chosen_hyps)
+    diversity_stats = caption_statistics(list(chosen_hyps.values()))
+    test_metrics.update(diversity_stats)
+
+    # 2. Controlled ablation: greedy vs beam k=3 vs beam k=5 with identical base parameters
+    ablation_results = {}
+    ab_hyps_dict = {}
+    if not args.no_ablation:
+        print("\nRunning controlled ablation (greedy vs beam k=3 vs beam k=5)...")
+        ablation_configs = {
+            "greedy": {"beam_width": 1, "length_penalty": 0.7, "repetition_penalty": 1.0, "ngram_block_size": 0},
+            "beam_3": {"beam_width": 3, "length_penalty": 0.7, "repetition_penalty": 1.0, "ngram_block_size": 0},
+            "beam_5": {"beam_width": 5, "length_penalty": 0.7, "repetition_penalty": 1.0, "ngram_block_size": 0},
+        }
+        for name, ab_cfg in ablation_configs.items():
+            ab_hyps = decode_one_setting(
+                model=model,
+                encoded_cache=encoded_cache,
+                records=records,
+                id_to_word=id_to_word,
+                max_length=max_length,
+                device=device,
+                setting=ab_cfg,
+                suppress_unk=suppress_unk,
+            )
+            ab_hyps_dict[name] = ab_hyps
+            ab_scores = evaluate_predictions(refs, ab_hyps)
+            ab_div = caption_statistics(list(ab_hyps.values()))
+            ab_scores.update(ab_div)
+            ablation_results[name] = ab_scores
+
+    # Save output artifacts
+    ckpt_stem = checkpoint_path.stem
+    metrics_path = RESULTS_DIR / f"{ckpt_stem}_test_evaluation.json"
+    predictions_path = RESULTS_DIR / f"{ckpt_stem}_test_predictions.json"
+
+    # Also save standard names for default pipeline
+    standard_metrics_path = RESULTS_DIR / "test_set_evaluation.json"
+    standard_predictions_path = RESULTS_DIR / "test_set_predictions.json"
+
+    per_video_scores = test_metrics.get("per_video", {})
+
+    output_records = [
+        {
+            "video_id": r["video_id"],
+            "prediction": chosen_hyps[r["video_id"]],
+            "predictions": {
+                "chosen": chosen_hyps[r["video_id"]],
+                **(
+                    {name: ab_hyps_dict[name][r["video_id"]] for name in ab_hyps_dict}
+                    if not args.no_ablation
+                    else {}
+                ),
+            },
+            "references": r["caption"],
+            "scores": per_video_scores.get(r["video_id"], {}),
+        }
+        for r in records
     ]
 
-    for k in metric_keys:
-        v_g10 = str(comparison["1.0"].get(k, "-"))
-        v_g12 = str(comparison["1.2"].get(k, "-"))
-        v_b3 = str(comparison["beam_3"].get(k, "-"))
-        v_b5 = str(comparison["beam_5"].get(k, "-"))
-        print(f"{k:<32} | {v_g10:<10} | {v_g12:<10} | {v_b3:<10} | {v_b5:<10}")
+    report = {
+        "checkpoint": str(checkpoint_path),
+        "checkpoint_epoch": checkpoint.get("epoch"),
+        "best_val_loss": checkpoint.get("best_val_loss"),
+        "best_val_cider": checkpoint.get("best_val_cider"),
+        "test_video_count": total_test,
+        "decoding_settings": chosen_config,
+        "decoding_config_source": str(decoding_config_path),
+        "evaluation_results": {k: v for k, v in test_metrics.items() if k != "per_video"},
+        "ablation_results": ablation_results,
+    }
 
-    print("=" * 80)
-    print("\nSaved metrics report to:", metrics_path)
-    print("Saved all predictions to:", captions_path)
+    for p in [metrics_path, standard_metrics_path]:
+        with p.open("w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2)
+
+    for p in [predictions_path, standard_predictions_path]:
+        with p.open("w", encoding="utf-8") as f:
+            json.dump(output_records, f, indent=2, ensure_ascii=False)
+
+    print("\n" + "=" * 70)
+    print("TEST EVALUATION RESULTS (TUNED DECODING)")
+    print(f"CIDEr:       {test_metrics.get('CIDEr', 0.0):.2f}")
+    print(f"BLEU-4:      {test_metrics.get('BLEU-4', 0.0):.2f}")
+    print(f"BLEU-3:      {test_metrics.get('BLEU-3', 0.0):.2f}")
+    print(f"BLEU-2:      {test_metrics.get('BLEU-2', 0.0):.2f}")
+    print(f"BLEU-1:      {test_metrics.get('BLEU-1', 0.0):.2f}")
+    print(f"METEOR:      {test_metrics.get('METEOR', 0.0):.2f}")
+    print(f"ROUGE-L:     {test_metrics.get('ROUGE-L', 0.0):.2f}")
+    print(f"Distinct-1:  {test_metrics.get('distinct_1', 0.0):.4f}")
+    print(f"Distinct-2:  {test_metrics.get('distinct_2', 0.0):.4f}")
+    print(f"Rep Bigram%: {test_metrics.get('repeated_bigram_caption_rate', 0.0):.4f}")
+    print("=" * 70)
+
+    if ablation_results:
+        print("\n" + "=" * 75)
+        print("CONTROLLED ABLATION RESULTS (identical rep_penalty=1.0, len_penalty=0.7, ngram_block=0)")
+        print(f"{'Strategy':<16} | {'CIDEr':<8} | {'BLEU-4':<8} | {'METEOR':<8} | {'ROUGE-L':<8}")
+        print("-" * 75)
+        for name, ab in ablation_results.items():
+            print(f"{name:<16} | {ab.get('CIDEr', 0.0):<8.2f} | {ab.get('BLEU-4', 0.0):<8.2f} | "
+                  f"{ab.get('METEOR', 0.0):<8.2f} | {ab.get('ROUGE-L', 0.0):<8.2f}")
+        print("=" * 75)
+
+    print(f"\nSaved test report to:      {metrics_path}")
+    print(f"Saved test predictions to: {predictions_path}")
 
 
 if __name__ == "__main__":

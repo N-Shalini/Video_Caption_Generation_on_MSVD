@@ -15,19 +15,25 @@ ANNOTATIONS_PATH = PROJECT_DIR / "data" / "annotations" / "msvd_test.json"
 FEATURE_DIR = PROJECT_DIR / "data" / "features" / "vgg16_spatial"
 
 
-def load_model(device, checkpoint_path=DEFAULT_CHECKPOINT):
+def load_model(device=None, checkpoint_path=DEFAULT_CHECKPOINT):
     checkpoint_path = Path(checkpoint_path)
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"Checkpoint not found at: {checkpoint_path}")
 
     checkpoint = torch.load(
         checkpoint_path,
-        map_location=device,
+        map_location="cpu",
         weights_only=False,
     )
 
     config = checkpoint["config"]
     vocab = checkpoint["vocab"]
+
+    if device is None:
+        dev_str = config.get("device", "cuda" if torch.cuda.is_available() else "cpu")
+        if dev_str.startswith("cuda") and not torch.cuda.is_available():
+            dev_str = "cpu"
+        device = torch.device(dev_str)
 
     encoder_type = config.get("encoder_type", "temporal")
 
@@ -51,20 +57,29 @@ def load_model(device, checkpoint_path=DEFAULT_CHECKPOINT):
 @torch.inference_mode()
 def greedy_decode(
     model,
-    features,
-    id_to_word,
-    max_length,
-    device,
+    features=None,
+    id_to_word=None,
+    max_length=30,
+    device=None,
     repetition_penalty=1.0,
+    suppress_unk=True,
+    encoder_out=None,
 ):
     if repetition_penalty < 1.0:
         raise ValueError("repetition_penalty must be >= 1.0")
 
-    features_t = torch.from_numpy(features).float().unsqueeze(0).to(device)
-    encoder_out = model.encoder(features_t)
+    if device is None:
+        device = next(model.parameters()).device
+
+    if encoder_out is None:
+        features_t = torch.from_numpy(features).float().unsqueeze(0).to(device)
+        encoder_out = model.encoder(features_t)
 
     hidden = encoder_out.mean(dim=1)
     cell = torch.zeros_like(hidden)
+
+    # Precompute key projection W1(encoder_out) once per sequence
+    precomputed_W1 = model.decoder.attention.W1(encoder_out)
 
     token_id = 1  # <bos>
     generated_words = []
@@ -76,7 +91,7 @@ def greedy_decode(
         embedding = model.decoder.embedding(token)
 
         context, attention_weights = model.decoder.attention(
-            encoder_out, hidden
+            encoder_out, hidden, precomputed_W1=precomputed_W1
         )
 
         lstm_input = torch.cat([embedding, context], dim=1)
@@ -94,6 +109,12 @@ def greedy_decode(
                     else:
                         logits[previous_id] *= repetition_penalty
 
+        # Suppress <pad> and <bos>
+        logits[0] = -float("inf")
+        logits[1] = -float("inf")
+        if suppress_unk:
+            logits[3] = -float("inf")
+
         token_id = int(torch.argmax(logits).item())
         attention_history.append(attention_weights.squeeze(0).cpu())
 
@@ -110,9 +131,9 @@ def greedy_decode(
 
 
 class BeamHypothesis:
-    def __init__(self, tokens, score, hidden, cell, last_token_id):
+    def __init__(self, tokens, cumulative_log_prob, hidden, cell, last_token_id):
         self.tokens = tokens
-        self.score = score
+        self.cumulative_log_prob = cumulative_log_prob
         self.hidden = hidden
         self.cell = cell
         self.last_token_id = last_token_id
@@ -121,37 +142,55 @@ class BeamHypothesis:
 @torch.inference_mode()
 def beam_search_decode(
     model,
-    features,
-    id_to_word,
-    max_length,
-    device,
+    features=None,
+    id_to_word=None,
+    max_length=30,
+    device=None,
     beam_width=5,
     length_penalty=0.7,
-    repetition_penalty=1.1,
-    ngram_block_size=3,
+    repetition_penalty=1.0,
+    ngram_block_size=0,
+    suppress_unk=True,
+    encoder_out=None,
 ):
-    features_t = torch.from_numpy(features).float().unsqueeze(0).to(device)
-    encoder_out = model.encoder(features_t)
+    if beam_width < 1:
+        raise ValueError("beam_width must be >= 1")
+    if repetition_penalty < 1.0:
+        raise ValueError("repetition_penalty must be >= 1.0")
+
+    if device is None:
+        device = next(model.parameters()).device
+
+    if encoder_out is None:
+        features_t = torch.from_numpy(features).float().unsqueeze(0).to(device)
+        encoder_out = model.encoder(features_t)
+
     init_hidden = encoder_out.mean(dim=1)
     init_cell = torch.zeros_like(init_hidden)
 
-    beams = [
+    # Precompute key projection W1(encoder_out) once per sequence
+    precomputed_W1 = model.decoder.attention.W1(encoder_out)
+
+    live = [
         BeamHypothesis(
             tokens=[],
-            score=0.0,
+            cumulative_log_prob=0.0,
             hidden=init_hidden,
             cell=init_cell,
-            last_token_id=1,
+            last_token_id=1,  # <bos>
         )
     ]
-    completed = []
+    finished = []
 
     for _ in range(max_length - 1):
         candidates = []
-        for hyp in beams:
+
+        for hyp in live:
             token = torch.tensor([hyp.last_token_id], dtype=torch.long, device=device)
             embed = model.decoder.embedding(token)
-            context, _ = model.decoder.attention(encoder_out, hyp.hidden)
+            context, _ = model.decoder.attention(
+                encoder_out, hyp.hidden, precomputed_W1=precomputed_W1
+            )
             lstm_input = torch.cat([embed, context], dim=1)
             next_hidden, next_cell = model.decoder.lstm_cell(
                 lstm_input, (hyp.hidden, hyp.cell)
@@ -171,51 +210,67 @@ def beam_search_decode(
             if ngram_block_size > 0 and len(hyp.tokens) >= ngram_block_size - 1:
                 ngram_prefix = tuple(hyp.tokens[-(ngram_block_size - 1):])
                 for i in range(len(hyp.tokens) - ngram_block_size + 1):
-                    if tuple(hyp.tokens[i:i + ngram_block_size - 1]) == ngram_prefix:
+                    if tuple(hyp.tokens[i : i + ngram_block_size - 1]) == ngram_prefix:
                         blocked_token = hyp.tokens[i + ngram_block_size - 1]
                         logits[blocked_token] = -float("inf")
 
             # Suppress <pad> and <bos>
             logits[0] = -float("inf")
             logits[1] = -float("inf")
+            if suppress_unk:
+                logits[3] = -float("inf")
 
             log_probs = F.log_softmax(logits, dim=-1)
             topk_log_probs, topk_indices = torch.topk(log_probs, k=beam_width)
 
             for k in range(beam_width):
                 token_id = int(topk_indices[k].item())
-                cand_score = hyp.score + float(topk_log_probs[k].item())
+                cand_log_prob = hyp.cumulative_log_prob + float(topk_log_probs[k].item())
 
                 if token_id == 2:  # <eos>
-                    norm_score = cand_score / (max(len(hyp.tokens), 1) ** length_penalty)
-                    completed.append((norm_score, hyp.tokens))
+                    completed_tokens = hyp.tokens + [token_id]
+                    length = len(completed_tokens)
+                    norm_score = cand_log_prob / (length ** length_penalty)
+                    finished.append((norm_score, completed_tokens))
                 else:
                     new_hyp = BeamHypothesis(
                         tokens=hyp.tokens + [token_id],
-                        score=cand_score,
+                        cumulative_log_prob=cand_log_prob,
                         hidden=next_hidden,
                         cell=next_cell,
                         last_token_id=token_id,
                     )
-                    norm_score = cand_score / (max(len(new_hyp.tokens), 1) ** length_penalty)
-                    candidates.append((norm_score, new_hyp))
+                    candidates.append(new_hyp)
 
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        beams = [c[1] for c in candidates[:beam_width]]
+        # Prune live hypotheses by raw cumulative log-prob
+        candidates.sort(key=lambda h: h.cumulative_log_prob, reverse=True)
+        live = candidates[:beam_width]
 
-        if len(completed) >= beam_width:
+        if not live:
             break
 
-    if completed:
-        completed.sort(key=lambda x: x[0], reverse=True)
-        best_tokens = completed[0][1]
-    elif beams:
-        beams.sort(key=lambda h: h.score / (max(len(h.tokens), 1) ** length_penalty), reverse=True)
-        best_tokens = beams[0].tokens
+        # Early stopping bound: valid only when length_penalty == 0.0
+        if length_penalty == 0.0 and finished:
+            best_finished_score = max(score for score, _ in finished)
+            if live[0].cumulative_log_prob <= best_finished_score:
+                break
+
+    if finished:
+        finished.sort(key=lambda x: x[0], reverse=True)
+        best_tokens = finished[0][1]
+    elif live:
+        # Fall back to best live hypothesis with same normalization
+        scored_live = []
+        for h in live:
+            length = max(len(h.tokens), 1)
+            score = h.cumulative_log_prob / (length ** length_penalty)
+            scored_live.append((score, h.tokens))
+        scored_live.sort(key=lambda x: x[0], reverse=True)
+        best_tokens = scored_live[0][1]
     else:
         best_tokens = []
 
-    words = [id_to_word.get(t, "<unk>") for t in best_tokens]
+    words = [id_to_word.get(t, "<unk>") for t in best_tokens if t not in (0, 1, 2)]
     return " ".join(words), []
 
 
@@ -267,18 +322,52 @@ def main():
     parser.add_argument(
         "--repetition-penalty",
         type=float,
-        default=1.2,
-        help="Repetition penalty (default: 1.2; 1.0 disables).",
+        default=1.0,
+        help="Repetition penalty (default: 1.0; disabled).",
     )
     parser.add_argument(
         "--ngram-block-size",
         type=int,
-        default=3,
-        help="N-gram repetition blocking size for beam search (default: 3).",
+        default=0,
+        help="N-gram repetition blocking size for beam search (default: 0; disabled).",
+    )
+    parser.add_argument(
+        "--suppress-unk",
+        action="store_true",
+        default=True,
+        help="Suppress <unk> during generation (default: True).",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Device to use ('cuda', 'cpu', etc.; overrides checkpoint/config).",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for reproducibility.",
     )
 
     args = parser.parse_args()
-    device = torch.device("cpu")
+
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
+        np.random.seed(args.seed)
+
+    device_arg = None
+    if args.device is not None:
+        dev_str = args.device
+        if dev_str.startswith("cuda") and not torch.cuda.is_available():
+            print(f"Warning: {dev_str} requested but CUDA is not available. Falling back to cpu.")
+            dev_str = "cpu"
+        device_arg = torch.device(dev_str)
+
+    model, config, vocab, id_to_word, checkpoint = load_model(
+        device=device_arg, checkpoint_path=args.checkpoint
+    )
+    device = next(model.parameters()).device
 
     with open(ANNOTATIONS_PATH, "r", encoding="utf-8") as file:
         records = json.load(file)
