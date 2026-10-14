@@ -23,10 +23,15 @@
   - Included all hyperparameters: `encoder_type`, `run_name`, `device`, `num_workers`, `seed`, `feature_type`, `num_frames`, `feature_channels`, `feature_height`, `feature_width`, `min_word_frequency`, `max_caption_length`, `embedding_dim`, `hidden_dim`, `attention_dim`, `dropout`, `batch_size`, `epochs`, `learning_rate`, `weight_decay`, `early_stopping_patience`, `gradient_clip_norm`, `captions_per_video`, `selection_metric`, `scheduled_sampling` (`max_prob`, `increment_per_epoch`), `scheduler` (`factor`, `patience`), and `suppress_unk`.
 
 ### [`train_spatiotemporal.py`](file:///c:/dev/video/train_spatiotemporal.py)
-- **Tasks 4 & 6: Checkpoint Selection, Validation Loss & Config Resolution**:
+- **Tasks 4, 6 & Resume/Logging**:
   - Command-line arguments default to `None` and override `config.json` only when explicitly passed. Added `--encoder-type` and `--run-name`.
+  - Added `--resume` flag: resumes training from `checkpoints/{run_name}_last.pt`.
+  - Checkpoint overwrite protection: without `--resume`, refuses to overwrite existing `checkpoints/{run_name}_best.pt` or `checkpoints/{run_name}_last.pt`, exiting with a clear error message and code 1 before modifying any filesystem state.
+  - Complete state serialization: `checkpoints/{run_name}_last.pt` persists all training state every epoch (`model_state_dict`, `optimizer_state_dict`, `scheduler_state_dict`, `epoch`, `best_metric_val`, `epochs_without_improvement`, `history`, `val_scores`, `config`, `vocab`, and `architecture`).
+  - Resumption restores model, optimizer (ensuring tensors map to active device), scheduler, sets `start_epoch = ckpt["epoch"] + 1`, restores `best_metric_val`, `epochs_without_improvement`, and `history`.
+  - Epoch logging: prints a single line per epoch with train loss, val loss, val CIDEr, BLEU-4, METEOR, ROUGE-L, learning rate, and elapsed seconds.
+  - History tracking: appends each epoch record to `results/{run_name}_history.json`.
   - Saves resolved config to `results/{run_name}_config_resolved.json` and embeds it into checkpoints.
-  - Saves both best (`checkpoints/{run_name}_best.pt`) and last (`checkpoints/{run_name}_last.pt`) checkpoints, and saves history to `results/{run_name}_history.json`.
   - Supports `--max-train-videos` and `--max-val-videos` dev smoke flags, recorded in the resolved config.
   - Calls `train_dataset.resample(epoch)` at the start of every epoch.
   - Evaluates validation loss over all reference captions (`captions_per_video=0`).

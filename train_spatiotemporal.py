@@ -2,6 +2,7 @@ import argparse
 import copy
 import json
 import random
+import sys
 import time
 from pathlib import Path
 
@@ -221,6 +222,12 @@ def main():
         default=None,
         help="Dev flag: limit number of val videos (smoke tests only).",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        default=False,
+        help="Resume training from an existing last checkpoint (checkpoints/{run_name}_last.pt).",
+    )
 
     args = parser.parse_args()
 
@@ -275,13 +282,30 @@ def main():
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    resolved_config_path = results_dir / f"{run_name}_config_resolved.json"
-    with resolved_config_path.open("w", encoding="utf-8") as f:
-        json.dump(resolved_config, f, indent=2)
-
     best_checkpoint = checkpoint_dir / f"{run_name}_best.pt"
     last_checkpoint = checkpoint_dir / f"{run_name}_last.pt"
     history_path = results_dir / f"{run_name}_history.json"
+    resolved_config_path = results_dir / f"{run_name}_config_resolved.json"
+
+    # Overwrite protection: without --resume, refuse to overwrite existing checkpoints
+    if not args.resume:
+        existing = []
+        if best_checkpoint.is_file():
+            existing.append(str(best_checkpoint))
+        if last_checkpoint.is_file():
+            existing.append(str(last_checkpoint))
+        if existing:
+            sys.stderr.write(
+                f"ERROR: Checkpoint(s) already exist for run '{run_name}':\n"
+                + "\n".join(f"  - {p}" for p in existing)
+                + f"\nRefusing to overwrite existing checkpoint(s) without --resume.\n"
+                + f"To resume this run, pass --resume.\n"
+                + f"To start a new run, specify a different --run-name.\n"
+            )
+            sys.exit(1)
+
+    with resolved_config_path.open("w", encoding="utf-8") as f:
+        json.dump(resolved_config, f, indent=2)
 
     print("=" * 70)
     print(f"TRAINING VIDEO CAPTION MODEL: {run_name}")
@@ -365,9 +389,58 @@ def main():
         patience=sched_cfg.get("patience", 2),
     )
 
+    start_epoch = 1
     best_metric_val = -float("inf") if selection_metric == "cider" else float("inf")
     history = []
     epochs_without_improvement = 0
+
+    if args.resume:
+        if not last_checkpoint.is_file():
+            sys.stderr.write(
+                f"ERROR: Cannot resume run '{run_name}': checkpoint not found at '{last_checkpoint}'.\n"
+            )
+            sys.exit(1)
+
+        print(f"[*] Resuming run '{run_name}' from: {last_checkpoint}")
+        ckpt = torch.load(last_checkpoint, map_location=device, weights_only=False)
+
+        model.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(device)
+
+        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+
+        start_epoch = ckpt["epoch"] + 1
+        if "best_metric_val" in ckpt:
+            best_metric_val = ckpt["best_metric_val"]
+        elif selection_metric == "cider" and "best_val_cider" in ckpt:
+            best_metric_val = ckpt["best_val_cider"]
+        elif selection_metric == "loss" and "best_val_loss" in ckpt:
+            best_metric_val = ckpt["best_val_loss"]
+        else:
+            best_metric_val = -float("inf") if selection_metric == "cider" else float("inf")
+
+        epochs_without_improvement = ckpt.get("epochs_without_improvement", 0)
+        history = ckpt.get("history", [])
+
+        if not history and history_path.is_file():
+            try:
+                with history_path.open("r", encoding="utf-8") as f:
+                    file_history = json.load(f)
+                if isinstance(file_history, list):
+                    history = file_history
+            except Exception:
+                pass
+
+        print(f"    Resuming at epoch {start_epoch} (completed epoch {ckpt['epoch']})")
+        print(f"    Best {selection_metric}: {best_metric_val:.4f} | Early-stop count: {epochs_without_improvement}/{resolved_config['early_stopping_patience']}\n")
+
+    if start_epoch > resolved_config["epochs"]:
+        print(f"Run '{run_name}' already completed all {resolved_config['epochs']} epochs.")
+        return
 
     print(f"Train samples per epoch: {len(train_dataset)}")
     print(f"Val loss references: {len(val_loss_dataset)} (across {len(val_records)} videos)")
@@ -380,7 +453,7 @@ def main():
     max_ss_prob = ss_cfg.get("max_prob", 0.15)
     ss_inc = ss_cfg.get("increment_per_epoch", 0.015)
 
-    for epoch in range(1, resolved_config["epochs"] + 1):
+    for epoch in range(start_epoch, resolved_config["epochs"] + 1):
         start_time = time.time()
 
         # Resample training captions for current epoch
@@ -429,6 +502,7 @@ def main():
 
         current_metric = val_cider if selection_metric == "cider" else val_loss
         scheduler.step(current_metric)
+        current_lr = optimizer.param_groups[0]["lr"]
 
         epoch_record = {
             "epoch": epoch,
@@ -438,7 +512,7 @@ def main():
             "val_bleu4": val_bleu4,
             "val_meteor": val_meteor,
             "val_rouge_l": val_rouge_l,
-            "learning_rate": optimizer.param_groups[0]["lr"],
+            "learning_rate": current_lr,
             "scheduled_sampling_prob": ss_prob,
             "seconds": round(time.time() - start_time, 2),
         }
@@ -446,13 +520,14 @@ def main():
 
         print(
             f"Epoch {epoch:02d}/{resolved_config['epochs']:02d} | "
-            f"train_loss={train_metrics['loss']:.4f} | "
-            f"val_loss={val_loss:.4f} | "
-            f"CIDEr={val_cider:.2f} | "
-            f"BLEU-4={val_bleu4:.2f} | "
-            f"METEOR={val_meteor:.2f} | "
-            f"ROUGE-L={val_rouge_l:.2f} | "
-            f"time={epoch_record['seconds']:.1f}s"
+            f"train loss: {train_metrics['loss']:.4f} | "
+            f"val loss: {val_loss:.4f} | "
+            f"val CIDEr: {val_cider:.4f} | "
+            f"BLEU-4: {val_bleu4:.4f} | "
+            f"METEOR: {val_meteor:.4f} | "
+            f"ROUGE-L: {val_rouge_l:.4f} | "
+            f"learning rate: {current_lr:.6g} | "
+            f"seconds: {epoch_record['seconds']:.2f}"
         )
 
         is_better = (
@@ -461,30 +536,48 @@ def main():
             else val_loss < best_metric_val
         )
 
-        save_dict = {
+        if is_better:
+            best_metric_val = current_metric
+            epochs_without_improvement = 0
+            best_save_dict = {
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "best_metric_val": best_metric_val,
+                "best_val_loss": val_loss,
+                "best_val_cider": val_cider,
+                "epochs_without_improvement": epochs_without_improvement,
+                "history": history,
+                "val_scores": val_coco_scores,
+                "config": resolved_config,
+                "vocab": train_dataset.vocab,
+                "architecture": encoder_type,
+            }
+            torch.save(best_save_dict, best_checkpoint)
+            print(f"  [*] Saved new best checkpoint based on {selection_metric}: {best_metric_val:.4f}")
+        else:
+            epochs_without_improvement += 1
+            print(f"  No improvement in {selection_metric}: {epochs_without_improvement}/{resolved_config['early_stopping_patience']}")
+
+        # The _last.pt checkpoint must contain all of these every epoch:
+        # model, optimizer, scheduler, epoch, best metric, early-stopping counter and history
+        last_save_dict = {
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
+            "best_metric_val": best_metric_val,
             "best_val_loss": val_loss,
             "best_val_cider": val_cider,
+            "epochs_without_improvement": epochs_without_improvement,
+            "history": history,
             "val_scores": val_coco_scores,
             "config": resolved_config,
             "vocab": train_dataset.vocab,
             "architecture": encoder_type,
         }
-
-        # Save last checkpoint every epoch
-        torch.save(save_dict, last_checkpoint)
-
-        if is_better:
-            best_metric_val = current_metric
-            epochs_without_improvement = 0
-            torch.save(save_dict, best_checkpoint)
-            print(f"  [*] Saved new best checkpoint based on {selection_metric}: {best_metric_val:.4f}")
-        else:
-            epochs_without_improvement += 1
-            print(f"  No improvement in {selection_metric}: {epochs_without_improvement}/{resolved_config['early_stopping_patience']}")
+        torch.save(last_save_dict, last_checkpoint)
 
         with history_path.open("w", encoding="utf-8") as file:
             json.dump(history, file, indent=2)
