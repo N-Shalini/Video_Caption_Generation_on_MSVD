@@ -1,0 +1,229 @@
+import random
+import json
+import re
+from pathlib import Path
+
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+ANNOTATION_DIR = PROJECT_ROOT / "data" / "annotations"
+FEATURE_DIR = PROJECT_ROOT / "data" / "features" / "vgg16_spatial"
+VOCAB_PATH = ANNOTATION_DIR / "vocab.json"
+
+MAX_CAPTION_LENGTH = 30
+EXPECTED_FEATURE_SHAPE = (8, 512, 7, 7)
+
+TOKEN_PATTERN = re.compile(r"\w+|[^\w\s]", re.UNICODE)
+
+
+def tokenize(text):
+    return TOKEN_PATTERN.findall(text.lower())
+
+
+def load_vocab(path=VOCAB_PATH):
+    with Path(path).open("r", encoding="utf-8") as file:
+        vocab = json.load(file)
+
+    required = {
+        "<pad>": 0,
+        "<bos>": 1,
+        "<eos>": 2,
+        "<unk>": 3,
+    }
+
+    for token, expected_id in required.items():
+        if vocab.get(token) != expected_id:
+            raise ValueError(
+                f"Invalid vocabulary ID for {token}: "
+                f"expected {expected_id}, got {vocab.get(token)}"
+            )
+
+    if sorted(vocab.values()) != list(range(len(vocab))):
+        raise ValueError("Vocabulary IDs must be unique and contiguous.")
+
+    return vocab
+
+
+class MSVDDataset(Dataset):
+    def __init__(
+        self,
+        split,
+        annotation_path=None,
+        feature_dir=FEATURE_DIR,
+        vocab_path=VOCAB_PATH,
+        max_caption_length=MAX_CAPTION_LENGTH,
+        captions_per_video=1,
+    ):
+        if split not in {"train", "val", "test"}:
+            raise ValueError(
+                "split must be 'train', 'val', or 'test'"
+            )
+
+        if max_caption_length < 2:
+            raise ValueError(
+                "max_caption_length must allow BOS and EOS"
+            )
+
+        if annotation_path is None:
+            annotation_path = ANNOTATION_DIR / f"msvd_{split}.json"
+
+        self.split = split
+        self.feature_dir = Path(feature_dir)
+        self.max_caption_length = max_caption_length
+        self.captions_per_video = max(1, int(captions_per_video))
+        self.vocab = load_vocab(vocab_path)
+
+        self.pad_idx = self.vocab["<pad>"]
+        self.bos_idx = self.vocab["<bos>"]
+        self.eos_idx = self.vocab["<eos>"]
+        self.unk_idx = self.vocab["<unk>"]
+
+        with Path(annotation_path).open(
+            "r", encoding="utf-8"
+        ) as file:
+            self.records = json.load(file)
+
+        if not isinstance(self.records, list):
+            raise ValueError("Annotations must contain a JSON list.")
+
+        seen_ids = set()
+
+        for record in self.records:
+            required_fields = {"video_id", "video", "caption"}
+            missing_fields = required_fields - set(record)
+
+            if missing_fields:
+                raise ValueError(
+                    f"Record is missing fields: {missing_fields}"
+                )
+
+            video_id = record["video_id"]
+
+            if video_id in seen_ids:
+                raise ValueError(
+                    f"Duplicate video ID in {split}: {video_id}"
+                )
+            seen_ids.add(video_id)
+
+            if not isinstance(record["caption"], list):
+                raise ValueError(
+                    f"Captions must be a list for {video_id}"
+                )
+
+            if not record["caption"]:
+                raise ValueError(
+                    f"No reference captions for {video_id}"
+                )
+
+            feature_path = self.feature_dir / f"{video_id}.npy"
+
+            if not feature_path.is_file():
+                raise FileNotFoundError(
+                    f"Missing features for {video_id}: {feature_path}"
+                )
+
+        self.video_ids = [record["video_id"] for record in self.records]
+
+        # Multi-caption expansion for training
+        if self.split == "train" and self.captions_per_video > 1:
+            self.samples = []
+            for record in self.records:
+                caps = record["caption"]
+                # Take up to captions_per_video distinct references
+                k = min(self.captions_per_video, len(caps))
+                for cap in caps[:k]:
+                    self.samples.append((record, cap))
+        else:
+            self.samples = None
+
+    def __len__(self):
+        if self.samples is not None:
+            return len(self.samples)
+        return len(self.records)
+
+    def encode_caption(self, caption):
+        tokens = tokenize(caption)
+
+        # Reserve two positions for BOS and EOS.
+        tokens = tokens[: self.max_caption_length - 2]
+        token_ids = [self.bos_idx]
+
+        token_ids.extend(
+            self.vocab.get(token, self.unk_idx)
+            for token in tokens
+        )
+        token_ids.append(self.eos_idx)
+
+        token_ids = token_ids[: self.max_caption_length]
+        token_ids.extend(
+            [self.pad_idx]
+            * (self.max_caption_length - len(token_ids))
+        )
+
+        return torch.tensor(token_ids, dtype=torch.long)
+
+    def __getitem__(self, index):
+        if self.samples is not None:
+            record, selected_caption = self.samples[index]
+            caption_ids = self.encode_caption(selected_caption)
+        else:
+            record = self.records[index]
+            if self.split == "train":
+                selected_caption = random.choice(record["caption"])
+                caption_ids = self.encode_caption(selected_caption)
+            elif self.split == "val":
+                # Fixed reference for reproducible validation loss.
+                selected_caption = record["caption"][0]
+                caption_ids = self.encode_caption(selected_caption)
+            else:
+                caption_ids = torch.empty(0, dtype=torch.long)
+
+        video_id = record["video_id"]
+        feature_path = self.feature_dir / f"{video_id}.npy"
+
+        features_np = np.load(feature_path, allow_pickle=False)
+
+        if features_np.shape != EXPECTED_FEATURE_SHAPE:
+            raise ValueError(
+                f"Unexpected feature shape for {video_id}: "
+                f"{features_np.shape}"
+            )
+
+        if features_np.dtype != np.float32:
+            raise TypeError(
+                f"Expected float32 features for {video_id}, "
+                f"got {features_np.dtype}"
+            )
+
+        if not np.isfinite(features_np).all():
+            raise ValueError(
+                f"Non-finite feature values for {video_id}"
+            )
+
+        features = torch.from_numpy(
+            np.ascontiguousarray(features_np)
+        )
+
+        return {
+            "video_id": video_id,
+            "features": features,
+            "caption_ids": caption_ids,
+            "references": record["caption"],
+        }
+
+
+def collate_video_batch(batch):
+    return {
+        "video_id": [item["video_id"] for item in batch],
+        "features": torch.stack(
+            [item["features"] for item in batch]
+        ),
+        "caption_ids": torch.stack(
+            [item["caption_ids"] for item in batch]
+        ),
+        "references": [item["references"] for item in batch],
+    }

@@ -1,0 +1,21 @@
+{
+  "seed": 42,
+  "feature_type": "vgg16_spatial",
+  "num_frames": 8,
+  "feature_channels": 512,
+  "feature_height": 7,
+  "feature_width": 7,
+  "min_word_frequency": 2,
+  "max_caption_length": 30,
+  "embedding_dim": 256,
+  "hidden_dim": 512,
+  "attention_dim": 512,
+  "dropout": 0.3,
+  "batch_size": 8,
+  "epochs": 20,
+  "learning_rate": 0.0001,
+  "weight_decay": 0.0001,
+  "early_stopping_patience": 4,
+  "gradient_clip_norm": 1.0,
+  "num_workers": 0
+}
