@@ -11,8 +11,96 @@ from model import VideoCaptionModel
 
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_CHECKPOINT = PROJECT_DIR / "checkpoints" / "temporal_attention_continued_best.pt"
+TRAIN_ANNOTATIONS_PATH = PROJECT_DIR / "data" / "annotations" / "msvd_train.json"
 ANNOTATIONS_PATH = PROJECT_DIR / "data" / "annotations" / "msvd_test.json"
 FEATURE_DIR = PROJECT_DIR / "data" / "features" / "vgg16_spatial"
+EOS_BLOCKLIST_CACHE_PATH = PROJECT_DIR / "data" / "annotations" / "eos_blocklist.json"
+
+
+def compute_eos_blocklist(
+    train_annotations_path,
+    vocab,
+    min_count=50,
+    max_eos_rate=0.002,
+    cache_path=None,
+):
+    from dataset import tokenize
+    from collections import Counter
+
+    train_path = Path(train_annotations_path)
+    if cache_path is None:
+        cache_path = EOS_BLOCKLIST_CACHE_PATH
+    else:
+        cache_path = Path(cache_path)
+
+    # Reuse cache if parameters match
+    if cache_path.is_file():
+        try:
+            with cache_path.open("r", encoding="utf-8") as f:
+                cached_data = json.load(f)
+            cached_params = cached_data.get("parameters", {})
+            if (
+                cached_params.get("min_count") == min_count
+                and cached_params.get("max_eos_rate") == max_eos_rate
+                and cached_params.get("train_annotations_file") == train_path.name
+            ):
+                if "blocked_words" in cached_data:
+                    return {vocab[w] for w in cached_data["blocked_words"] if w in vocab}
+                return set(int(t) for t in cached_data["blocked_token_ids"] if int(t) in vocab.values())
+        except Exception:
+            pass
+
+    with train_path.open("r", encoding="utf-8") as f:
+        records = json.load(f)
+
+    total_counts = Counter()
+    final_counts = Counter()
+
+    for record in records:
+        captions = record.get("caption", [])
+        if isinstance(captions, str):
+            captions = [captions]
+        for cap in captions:
+            tokens = tokenize(cap)
+            if not tokens:
+                continue
+            for tok in tokens:
+                total_counts[tok] += 1
+            final_counts[tokens[-1]] += 1
+
+    blocked_token_ids = set()
+    blocked_words = []
+
+    for word, count in total_counts.items():
+        if count >= min_count:
+            final_c = final_counts.get(word, 0)
+            eos_rate = final_c / count
+            if eos_rate <= max_eos_rate:
+                if word in vocab:
+                    blocked_token_ids.add(vocab[word])
+                blocked_words.append(word)
+
+    blocked_words.sort()
+    cache_content = {
+        "note": "Derived strictly from TRAIN annotations only. Non-terminal tokens that rarely or never end complete captions.",
+        "parameters": {
+            "min_count": min_count,
+            "max_eos_rate": max_eos_rate,
+            "train_annotations_file": train_path.name,
+        },
+        "num_blocked_tokens": len(blocked_words),
+        "blocked_token_ids": sorted(list(blocked_token_ids)),
+        "blocked_words": blocked_words,
+    }
+
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with cache_path.open("w", encoding="utf-8") as f:
+            json.dump(cache_content, f, indent=2)
+    except Exception:
+        pass
+
+    return blocked_token_ids
 
 
 def load_model(device=None, checkpoint_path=DEFAULT_CHECKPOINT):
@@ -64,6 +152,7 @@ def greedy_decode(
     repetition_penalty=1.0,
     suppress_unk=True,
     encoder_out=None,
+    block_eos_after=None,
 ):
     if repetition_penalty < 1.0:
         raise ValueError("repetition_penalty must be >= 1.0")
@@ -115,6 +204,9 @@ def greedy_decode(
         if suppress_unk:
             logits[3] = -float("inf")
 
+        if block_eos_after is not None and token_id in block_eos_after:
+            logits[2] = -float("inf")
+
         token_id = int(torch.argmax(logits).item())
         attention_history.append(attention_weights.squeeze(0).cpu())
 
@@ -152,6 +244,7 @@ def beam_search_decode(
     ngram_block_size=0,
     suppress_unk=True,
     encoder_out=None,
+    block_eos_after=None,
 ):
     if beam_width < 1:
         raise ValueError("beam_width must be >= 1")
@@ -219,6 +312,9 @@ def beam_search_decode(
             logits[1] = -float("inf")
             if suppress_unk:
                 logits[3] = -float("inf")
+
+            if block_eos_after is not None and hyp.last_token_id in block_eos_after:
+                logits[2] = -float("inf")
 
             log_probs = F.log_softmax(logits, dim=-1)
             topk_log_probs, topk_indices = torch.topk(log_probs, k=beam_width)
@@ -337,6 +433,27 @@ def main():
         default=True,
         help="Suppress <unk> during generation (default: True).",
     )
+    if hasattr(argparse, "BooleanOptionalAction"):
+        parser.add_argument(
+            "--eos-blocklist",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="Block <eos> token immediately after non-terminal tokens (default: True).",
+        )
+    else:
+        parser.add_argument(
+            "--eos-blocklist",
+            dest="eos_blocklist",
+            action="store_true",
+            default=True,
+            help="Block <eos> token immediately after non-terminal tokens (default: True).",
+        )
+        parser.add_argument(
+            "--no-eos-blocklist",
+            dest="eos_blocklist",
+            action="store_false",
+            help="Disable EOS blocklist.",
+        )
     parser.add_argument(
         "--device",
         type=str,
@@ -404,6 +521,10 @@ def main():
         device, checkpoint_path=args.checkpoint
     )
 
+    block_eos_after = None
+    if args.eos_blocklist:
+        block_eos_after = compute_eos_blocklist(TRAIN_ANNOTATIONS_PATH, vocab)
+
     if args.decoding == "beam":
         caption, _ = beam_search_decode(
             model=model,
@@ -415,6 +536,7 @@ def main():
             length_penalty=args.length_penalty,
             repetition_penalty=args.repetition_penalty,
             ngram_block_size=args.ngram_block_size,
+            block_eos_after=block_eos_after,
         )
     else:
         caption, _ = greedy_decode(
@@ -424,12 +546,14 @@ def main():
             max_length=config["max_caption_length"],
             device=device,
             repetition_penalty=args.repetition_penalty,
+            block_eos_after=block_eos_after,
         )
 
     print(f"Checkpoint: {Path(args.checkpoint).name} (Epoch {checkpoint['epoch']}, Best Val Loss {checkpoint['best_val_loss']:.4f})")
     print(f"Test record index: {args.index}")
     print(f"Video ID: {video_id}")
     print(f"Decoding: {args.decoding.upper()}" + (f" (k={args.beam_width})" if args.decoding == 'beam' else ''))
+    print(f"EOS blocklist: {'enabled (' + str(len(block_eos_after)) + ' tokens)' if block_eos_after else 'disabled'}")
     print(f"Repetition penalty: {args.repetition_penalty}")
     print(f"Reference captions count: {len(record['caption'])}")
     print(f"\nGenerated caption: {caption}")

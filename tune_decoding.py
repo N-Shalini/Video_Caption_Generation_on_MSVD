@@ -3,15 +3,17 @@ import itertools
 import json
 import time
 from pathlib import Path
+import random
 
 import numpy as np
 import torch
 
-from generate_caption import load_model, greedy_decode, beam_search_decode
+from generate_caption import load_model, greedy_decode, beam_search_decode, compute_eos_blocklist
 from metrics import evaluate_predictions
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_CHECKPOINT = PROJECT_ROOT / "checkpoints" / "temporal_attention_continued_best.pt"
+TRAIN_ANNOTATIONS = PROJECT_ROOT / "data" / "annotations" / "msvd_train.json"
 VAL_ANNOTATIONS = PROJECT_ROOT / "data" / "annotations" / "msvd_val.json"
 FEATURE_DIR = PROJECT_ROOT / "data" / "features" / "vgg16_spatial"
 DEFAULT_OUTPUT = PROJECT_ROOT / "results" / "decoding_selection.json"
@@ -70,6 +72,33 @@ def main():
         default=None,
         help="Random seed for reproducibility (defaults to config seed).",
     )
+    parser.add_argument(
+        "--train-annotations",
+        type=str,
+        default=str(TRAIN_ANNOTATIONS),
+        help="Path to train annotations JSON (used for EOS blocklist).",
+    )
+    if hasattr(argparse, "BooleanOptionalAction"):
+        parser.add_argument(
+            "--eos-blocklist",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="Block <eos> token immediately after non-terminal tokens (default: True).",
+        )
+    else:
+        parser.add_argument(
+            "--eos-blocklist",
+            dest="eos_blocklist",
+            action="store_true",
+            default=True,
+            help="Block <eos> token immediately after non-terminal tokens (default: True).",
+        )
+        parser.add_argument(
+            "--no-eos-blocklist",
+            dest="eos_blocklist",
+            action="store_false",
+            help="Disable EOS blocklist.",
+        )
     parser.add_argument(
         "--max-val-videos",
         type=int,
@@ -135,7 +164,17 @@ def main():
             enc_out = model.encoder(feat_t)
             encoded_cache[vid] = enc_out
 
-    # Define hyperparameter grid
+    # Load or compute EOS blocklist
+    if args.eos_blocklist:
+        train_annotations_path = Path(args.train_annotations)
+        block_eos_after = compute_eos_blocklist(train_annotations_path, vocab)
+    else:
+        block_eos_after = None
+    blocklist_size = len(block_eos_after) if block_eos_after is not None else 0
+
+    # Define deduplicated hyperparameter grid:
+    # For beam_width==1 iterate only repetition_penalty (length_penalty=0.0, ngram_block_size=0);
+    # for beam_width>1 keep the full grid.
     beam_widths = [1, 3, 5]
     length_penalties = [0.0, 0.5, 0.7, 1.0]
     repetition_penalties = [1.0, 1.1, 1.2]
@@ -144,90 +183,103 @@ def main():
     max_length = config.get("max_caption_length", 30)
     suppress_unk = config.get("suppress_unk", True)
 
-    total_combinations = len(beam_widths) * len(length_penalties) * len(repetition_penalties) * len(ngram_block_sizes)
+    grid_configurations = []
+    # beam_width == 1
+    for rp in repetition_penalties:
+        grid_configurations.append((1, 0.0, rp, 0))
+
+    # beam_width > 1
+    for bw in [b for b in beam_widths if b > 1]:
+        for lp in length_penalties:
+            for rp in repetition_penalties:
+                for nb in ngram_block_sizes:
+                    grid_configurations.append((bw, lp, rp, nb))
+
+    total_combinations = len(grid_configurations)
     print(f"Evaluating {total_combinations} grid combinations on validation set...\n")
 
     val_table = []
     combo_idx = 0
     start_time = time.time()
 
-    # Cache greedy outputs to avoid redundant calls when beam_width=1 and length_penalty varies
+    # Cache greedy outputs to avoid redundant calls
     greedy_cache = {}
 
-    for bw in beam_widths:
-        for lp in length_penalties:
-            for rp in repetition_penalties:
-                for nb in ngram_block_sizes:
-                    combo_idx += 1
-                    hyps = {}
+    for bw, lp, rp, nb in grid_configurations:
+        combo_idx += 1
+        hyps = {}
 
-                    if bw == 1:
-                        # Greedy decoding (independent of length_penalty)
-                        cache_key = (rp, nb, suppress_unk)
-                        if cache_key in greedy_cache:
-                            hyps = greedy_cache[cache_key]
-                        else:
-                            with torch.inference_mode():
-                                for r in records:
-                                    vid = r["video_id"]
-                                    enc_out = encoded_cache[vid]
-                                    cap, _ = greedy_decode(
-                                        model=model,
-                                        encoder_out=enc_out,
-                                        id_to_word=id_to_word,
-                                        max_length=max_length,
-                                        device=device,
-                                        repetition_penalty=rp,
-                                        suppress_unk=suppress_unk,
-                                    )
-                                    hyps[vid] = cap
-                            greedy_cache[cache_key] = hyps
-                    else:
-                        with torch.inference_mode():
-                            for r in records:
-                                vid = r["video_id"]
-                                enc_out = encoded_cache[vid]
-                                cap, _ = beam_search_decode(
-                                    model=model,
-                                    encoder_out=enc_out,
-                                    id_to_word=id_to_word,
-                                    max_length=max_length,
-                                    device=device,
-                                    beam_width=bw,
-                                    length_penalty=lp,
-                                    repetition_penalty=rp,
-                                    ngram_block_size=nb,
-                                    suppress_unk=suppress_unk,
-                                )
-                                hyps[vid] = cap
-
-                    scores = evaluate_predictions(refs, hyps)
-
-                    entry = {
-                        "beam_width": bw,
-                        "length_penalty": lp,
-                        "repetition_penalty": rp,
-                        "ngram_block_size": nb,
-                        "CIDEr": scores["CIDEr"],
-                        "BLEU-4": scores["BLEU-4"],
-                        "BLEU-3": scores["BLEU-3"],
-                        "BLEU-2": scores["BLEU-2"],
-                        "BLEU-1": scores["BLEU-1"],
-                        "METEOR": scores["METEOR"],
-                        "ROUGE-L": scores["ROUGE-L"],
-                    }
-                    val_table.append(entry)
-
-                    if combo_idx % 12 == 0 or combo_idx == total_combinations:
-                        elapsed = time.time() - start_time
-                        print(
-                            f"[{combo_idx}/{total_combinations}] bw={bw} lp={lp} rp={rp} nb={nb} | "
-                            f"CIDEr={scores['CIDEr']:.2f} BLEU-4={scores['BLEU-4']:.2f} ({elapsed:.1f}s)"
+        if bw == 1:
+            cache_key = (rp, nb, suppress_unk, args.eos_blocklist)
+            if cache_key in greedy_cache:
+                hyps = greedy_cache[cache_key]
+            else:
+                with torch.inference_mode():
+                    for r in records:
+                        vid = r["video_id"]
+                        enc_out = encoded_cache[vid]
+                        cap, _ = greedy_decode(
+                            model=model,
+                            encoder_out=enc_out,
+                            id_to_word=id_to_word,
+                            max_length=max_length,
+                            device=device,
+                            repetition_penalty=rp,
+                            suppress_unk=suppress_unk,
+                            block_eos_after=block_eos_after,
                         )
+                        hyps[vid] = cap
+                greedy_cache[cache_key] = hyps
+        else:
+            with torch.inference_mode():
+                for r in records:
+                    vid = r["video_id"]
+                    enc_out = encoded_cache[vid]
+                    cap, _ = beam_search_decode(
+                        model=model,
+                        encoder_out=enc_out,
+                        id_to_word=id_to_word,
+                        max_length=max_length,
+                        device=device,
+                        beam_width=bw,
+                        length_penalty=lp,
+                        repetition_penalty=rp,
+                        ngram_block_size=nb,
+                        suppress_unk=suppress_unk,
+                        block_eos_after=block_eos_after,
+                    )
+                    hyps[vid] = cap
+
+        scores = evaluate_predictions(refs, hyps)
+
+        entry = {
+            "beam_width": bw,
+            "length_penalty": lp,
+            "repetition_penalty": rp,
+            "ngram_block_size": nb,
+            "eos_blocklist": bool(args.eos_blocklist),
+            "CIDEr": scores["CIDEr"],
+            "BLEU-4": scores["BLEU-4"],
+            "BLEU-3": scores["BLEU-3"],
+            "BLEU-2": scores["BLEU-2"],
+            "BLEU-1": scores["BLEU-1"],
+            "METEOR": scores["METEOR"],
+            "ROUGE-L": scores["ROUGE-L"],
+        }
+        val_table.append(entry)
+
+        if combo_idx % 12 == 0 or combo_idx == total_combinations:
+            elapsed = time.time() - start_time
+            print(
+                f"[{combo_idx}/{total_combinations}] bw={bw} lp={lp} rp={rp} nb={nb} | "
+                f"CIDEr={scores['CIDEr']:.2f} BLEU-4={scores['BLEU-4']:.2f} ({elapsed:.1f}s)"
+            )
 
     # Sort descending by val CIDEr
     val_table.sort(key=lambda x: x["CIDEr"], reverse=True)
     best_config = val_table[0]
+    best_config["eos_blocklist"] = bool(args.eos_blocklist)
+    best_config["blocklist_size"] = blocklist_size
 
     if args.output is not None:
         output_path = Path(args.output)
@@ -241,6 +293,8 @@ def main():
         "best_config": best_config,
         "checkpoint": str(checkpoint_path),
         "val_video_count": val_count,
+        "eos_blocklist": bool(args.eos_blocklist),
+        "blocklist_size": blocklist_size,
         "val_table": val_table,
     }
 
@@ -257,6 +311,7 @@ def main():
     print(f"Length penalty:     {best_config['length_penalty']}")
     print(f"Repetition penalty: {best_config['repetition_penalty']}")
     print(f"N-gram block size:  {best_config['ngram_block_size']}")
+    print(f"EOS blocklist:      {best_config['eos_blocklist']} (size={best_config['blocklist_size']})")
     print(f"Val CIDEr:          {best_config['CIDEr']:.2f}")
     print(f"Val BLEU-4:         {best_config['BLEU-4']:.2f}")
     print(f"Val METEOR:         {best_config['METEOR']:.2f}")

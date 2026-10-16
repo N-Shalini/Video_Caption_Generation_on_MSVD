@@ -64,3 +64,5 @@ wandb/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+archive_old/

@@ -7,10 +7,11 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from generate_caption import load_model, greedy_decode, beam_search_decode
+from generate_caption import load_model, greedy_decode, beam_search_decode, compute_eos_blocklist
 from metrics import evaluate_predictions, caption_statistics
 
 ROOT = Path(__file__).resolve().parent
+TRAIN_ANNOTATIONS_PATH = ROOT / "data" / "annotations" / "msvd_train.json"
 ANNOTATIONS_PATH = ROOT / "data" / "annotations" / "msvd_test.json"
 FEATURE_DIR = ROOT / "data" / "features" / "vgg16_spatial"
 RESULTS_DIR = ROOT / "results"
@@ -30,11 +31,24 @@ def find_default_checkpoint():
     return ROOT / "checkpoints" / "temporal_attention_continued_best.pt"
 
 
-def decode_one_setting(model, encoded_cache, records, id_to_word, max_length, device, setting, suppress_unk=True):
+def decode_one_setting(
+    model,
+    encoded_cache,
+    records,
+    id_to_word,
+    max_length,
+    device,
+    setting,
+    suppress_unk=True,
+    block_eos_after=None,
+):
     bw = setting.get("beam_width", 1)
     lp = setting.get("length_penalty", 0.7)
     rp = setting.get("repetition_penalty", 1.0)
     nb = setting.get("ngram_block_size", 0)
+
+    setting_blocklist = setting.get("eos_blocklist", True)
+    effective_block_eos = block_eos_after if setting_blocklist else None
 
     hyps = {}
     with torch.inference_mode():
@@ -50,6 +64,7 @@ def decode_one_setting(model, encoded_cache, records, id_to_word, max_length, de
                     device=device,
                     repetition_penalty=rp,
                     suppress_unk=suppress_unk,
+                    block_eos_after=effective_block_eos,
                 )
             else:
                 cap, _ = beam_search_decode(
@@ -63,6 +78,7 @@ def decode_one_setting(model, encoded_cache, records, id_to_word, max_length, de
                     repetition_penalty=rp,
                     ngram_block_size=nb,
                     suppress_unk=suppress_unk,
+                    block_eos_after=effective_block_eos,
                 )
             hyps[vid] = cap
     return hyps
@@ -109,6 +125,33 @@ def main():
         help="Dev/smoke flag: limit number of test videos.",
     )
     parser.add_argument(
+        "--train-annotations",
+        type=str,
+        default=str(TRAIN_ANNOTATIONS_PATH),
+        help="Path to train annotations JSON (used for EOS blocklist).",
+    )
+    if hasattr(argparse, "BooleanOptionalAction"):
+        parser.add_argument(
+            "--eos-blocklist",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help="Enable EOS blocklist (defaults to setting in decoding config, or True).",
+        )
+    else:
+        parser.add_argument(
+            "--eos-blocklist",
+            dest="eos_blocklist",
+            action="store_true",
+            default=None,
+            help="Enable EOS blocklist (defaults to setting in decoding config, or True).",
+        )
+        parser.add_argument(
+            "--no-eos-blocklist",
+            dest="eos_blocklist",
+            action="store_false",
+            help="Disable EOS blocklist.",
+        )
+    parser.add_argument(
         "--no-ablation",
         action="store_true",
         help="Skip controlled ablation (greedy vs beam k=3 vs beam k=5).",
@@ -145,6 +188,13 @@ def main():
 
     chosen_config = decoding_data.get("best_config", decoding_data)
 
+    if args.eos_blocklist is not None:
+        use_eos_blocklist = bool(args.eos_blocklist)
+    else:
+        use_eos_blocklist = bool(
+            chosen_config.get("eos_blocklist", decoding_data.get("eos_blocklist", True))
+        )
+
     # Resolve device
     device_arg = None
     if args.device is not None:
@@ -160,6 +210,12 @@ def main():
     device = next(model.parameters()).device
     model.eval()
 
+    if use_eos_blocklist:
+        train_annotations = Path(args.train_annotations)
+        block_eos_after = compute_eos_blocklist(train_annotations, vocab)
+    else:
+        block_eos_after = None
+
     seed = args.seed if args.seed is not None else config.get("seed", 42)
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -173,7 +229,8 @@ def main():
     print(f"Loaded config: beam_width={chosen_config.get('beam_width', 1)}, "
           f"length_penalty={chosen_config.get('length_penalty', 0.7)}, "
           f"repetition_penalty={chosen_config.get('repetition_penalty', 1.0)}, "
-          f"ngram_block_size={chosen_config.get('ngram_block_size', 0)}")
+          f"ngram_block_size={chosen_config.get('ngram_block_size', 0)}, "
+          f"eos_blocklist={use_eos_blocklist}")
     print("=" * 70)
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -222,6 +279,7 @@ def main():
         device=device,
         setting=chosen_config,
         suppress_unk=suppress_unk,
+        block_eos_after=block_eos_after,
     )
 
     test_metrics = evaluate_predictions(refs, chosen_hyps)
@@ -248,6 +306,7 @@ def main():
                 device=device,
                 setting=ab_cfg,
                 suppress_unk=suppress_unk,
+                block_eos_after=block_eos_after,
             )
             ab_hyps_dict[name] = ab_hyps
             ab_scores = evaluate_predictions(refs, ab_hyps)
@@ -283,6 +342,9 @@ def main():
         }
         for r in records
     ]
+
+    chosen_config["eos_blocklist"] = use_eos_blocklist
+    chosen_config["blocklist_size"] = len(block_eos_after) if block_eos_after is not None else 0
 
     report = {
         "checkpoint": str(checkpoint_path),

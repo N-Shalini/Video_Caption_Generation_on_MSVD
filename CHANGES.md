@@ -103,3 +103,39 @@
 7. **Deleted Legacy Scripts**: `demo.py`, `train.py`, and `train_backup.py` were requested by the user to be left as deleted.
 8. **Clean Workspace & Unique Run Identifiers**: All temporary smoke-test artifacts (checkpoints, histories, and 20-video `decoding_selection.json`) were purged. `train_spatiotemporal.py` dynamically assigns distinct run names (`{encoder_type}_vgg` or explicit `--run-name`) for full training runs to prevent stale configuration use or cross-run collisions.
 9. **Device, Seed, and CLI Parameter Handling**: `tune_decoding.py`, `evaluate_test_set.py`, `generate_caption.py`, and `train_spatiotemporal.py` dynamically resolve `device` from config or checkpoint with explicit `--device` CLI overrides, gracefully falling back to CPU if CUDA is requested on non-GPU environments. All CLI interfaces accept `--checkpoint` and `--seed` flags for multi-seed experiments. Model-specific decoding configs (`results/{checkpoint_stem}_decoding_selection.json`) are automatically written and discovered. The authoritative config and resolved configs default dev smoke flags (`max_train_videos`, `max_val_videos`) to `null`.
+
+---
+
+## 3. End-Of-Sequence (<eos>) Blocklist Rule & Decoding Tuning Optimization
+
+### 3.1 Motivation & Method
+Auto-regressive caption models frequently suffer from premature `<eos>` emission following non-terminal tokens (e.g. articles such as "a", "the", prepositions such as "in", "into", "of", and auxiliary/transitive verbs), resulting in incomplete phrases like *"a woman is playing with a <eos>"* or *"a man in the <eos>"*. The EOS blocklist rule eliminates this failure mode without fine-tuning weights by masking `logits[2]` (`<eos>`) to $-\infty$ immediately following any token known to rarely or never terminate complete sentences.
+
+### 3.2 Key Implementations
+- **Strict TRAIN Provenance & Caching ([`generate_caption.py`](file:///c:/dev/video/generate_caption.py))**:
+  - Implemented `compute_eos_blocklist(train_annotations_path, vocab, min_count=50, max_eos_rate=0.002, cache_path=None)`: tokenizes TRAIN split captions only (`dataset.tokenize`), tracking total occurrences and final-token frequencies for each token $w$. Tokens with $\text{count} \ge 50$ and $\frac{\text{final\_count}}{\text{count}} \le 0.002$ are added to the blocklist.
+  - Caches results to `data/annotations/eos_blocklist.json` along with configuration parameters and an explicit provenance note affirming extraction from the TRAIN split only (preventing validation/test leakage). Reuses the cache if parameters match.
+- **Decoding Rule Enforcement ([`generate_caption.py`](file:///c:/dev/video/generate_caption.py))**:
+  - Added optional `block_eos_after` (set of token IDs, default `None`) to both `greedy_decode` and `beam_search_decode`.
+  - In `greedy_decode`: sets `logits[2] = -float("inf")` before `torch.argmax` whenever the previous token ID is in `block_eos_after`.
+  - In `beam_search_decode`: sets `logits[2] = -float("inf")` per hypothesis before log-softmax and top-$k$ pruning whenever `hyp.last_token_id` is in `block_eos_after`.
+  - Retains identical behavior when `block_eos_after=None`, ensuring zero disruption to training validation routines in `train_spatiotemporal.py`.
+- **Deduplicated Grid Search ([`tune_decoding.py`](file:///c:/dev/video/tune_decoding.py))**:
+  - Deduplicated greedy search: for `beam_width == 1`, loops only over `repetition_penalty` with `length_penalty=0.0` and `ngram_block_size=0`, eliminating 21 redundant evaluations. For `beam_width > 1`, retains the full grid ($2 \times 4 \times 3 \times 2 = 48$), reducing total combinations from 72 to 51.
+  - Added `--eos-blocklist` / `--no-eos-blocklist` CLI flags (default: enabled).
+  - Serializes `"eos_blocklist"` (bool) and `"blocklist_size"` into `best_config` and `result_payload`.
+- **Decoding Config Propagation ([`evaluate_test_set.py`](file:///c:/dev/video/evaluate_test_set.py))**:
+  - Added `--eos-blocklist` / `--no-eos-blocklist` CLI flags (defaulting to config setting).
+  - Reads `"eos_blocklist"` directly from the tuned decoding configuration, loading the train blocklist and passing it through `decode_one_setting` to both the primary evaluation and controlled ablation.
+- **Validation Ablation Script ([`ablate_eos_rule.py`](file:///c:/dev/video/ablate_eos_rule.py))**:
+  - Standalone script evaluating greedy and beam_5 ($lp=0.7$) with and without the blocklist strictly on the validation set.
+  - Measures standard COCO metrics (`CIDEr`, `BLEU-1`..`4`, `METEOR`, `ROUGE-L`), share of captions ending in a blocklist token, mean caption length, and unique word count.
+  - Outputs formatted results table and serializes to `results/{checkpoint_stem}_eos_rule_val.json`.
+- **Unit Tests ([`tests/test_eos_blocklist.py`](file:///c:/dev/video/tests/test_eos_blocklist.py) & [`tests/test_decoding_tuning.py`](file:///c:/dev/video/tests/test_decoding_tuning.py))**:
+  - Validates blocklist membership: includes 'a' and 'the', and excludes common sentence-ending nouns ("bowl", "egg", "water", "cat", "dog", etc.).
+  - Validates tiny seeded model behavior: `<eos>` is never emitted right after a blocked token in greedy and beam decoding.
+  - Validates forced logits test: blocking intervenes when `<eos>` would otherwise be emitted.
+  - Validates backward compatibility: output is completely unchanged when rule is disabled (`block_eos_after=None`).
+  - Validates grid deduplication: exactly 51 unique configurations with fixed parameters for $k=1$.
+  - Validates test set config reading: `"eos_blocklist"` is properly read from JSON configurations.
+

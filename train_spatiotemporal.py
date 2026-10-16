@@ -54,6 +54,10 @@ def run_epoch(
     for batch in loader:
         features = batch["features"].to(device)
         captions = batch["caption_ids"].to(device)
+        # Trim padding columns: the loss is unchanged (pad targets are ignored),
+        # but the decoder runs far fewer time steps.
+        max_len = int(captions.ne(pad_idx).sum(dim=1).max().item())
+        captions = captions[:, :max_len]
 
         decoder_input = captions[:, :-1]
         targets = captions[:, 1:]

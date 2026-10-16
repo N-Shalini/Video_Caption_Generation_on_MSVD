@@ -16,13 +16,13 @@
   "attention_dim": 512,
   "dropout": 0.3,
   "batch_size": 8,
-  "epochs": 20,
-  "learning_rate": 0.0001,
+  "epochs": 40,
+  "learning_rate": 0.0003,
   "weight_decay": 0.0001,
   "early_stopping_patience": 6,
   "gradient_clip_norm": 1.0,
   "captions_per_video": 3,
-  "selection_metric": "cider",
+  "selection_metric": "loss",
   "scheduled_sampling": {
     "max_prob": 0.15,
     "increment_per_epoch": 0.015
