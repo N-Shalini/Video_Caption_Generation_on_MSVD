@@ -124,6 +124,7 @@ def load_model(device=None, checkpoint_path=DEFAULT_CHECKPOINT):
         device = torch.device(dev_str)
 
     encoder_type = config.get("encoder_type", "temporal")
+    attention_type = config.get("attention_type", checkpoint.get("attention_type", "additive"))
 
     model = VideoCaptionModel(
         vocab_size=len(vocab),
@@ -132,6 +133,7 @@ def load_model(device=None, checkpoint_path=DEFAULT_CHECKPOINT):
         hidden_dim=config["hidden_dim"],
         dropout=config["dropout"],
         encoder_type=encoder_type,
+        attention_type=attention_type,
     ).to(device)
 
     model.load_state_dict(checkpoint["model_state_dict"])
@@ -167,8 +169,21 @@ def greedy_decode(
     hidden = encoder_out.mean(dim=1)
     cell = torch.zeros_like(hidden)
 
-    # Precompute key projection W1(encoder_out) once per sequence
-    precomputed_W1 = model.decoder.attention.W1(encoder_out)
+    # Precompute key projection W1(encoder_out) once per sequence for additive attention
+    attn_type = getattr(model.decoder, "attention_type", "additive")
+    if attn_type == "additive":
+        precomputed_W1 = model.decoder.attention.W1(encoder_out)
+        mean_context = None
+        uniform_weights = None
+    else:
+        precomputed_W1 = None
+        mean_context = encoder_out.mean(dim=1)
+        uniform_weights = torch.full(
+            (encoder_out.size(0), encoder_out.size(1)),
+            1.0 / encoder_out.size(1),
+            device=encoder_out.device,
+            dtype=encoder_out.dtype,
+        )
 
     token_id = 1  # <bos>
     generated_words = []
@@ -179,9 +194,13 @@ def greedy_decode(
         token = torch.tensor([token_id], dtype=torch.long, device=device)
         embedding = model.decoder.embedding(token)
 
-        context, attention_weights = model.decoder.attention(
-            encoder_out, hidden, precomputed_W1=precomputed_W1
-        )
+        if attn_type == "additive":
+            context, attention_weights = model.decoder.attention(
+                encoder_out, hidden, precomputed_W1=precomputed_W1
+            )
+        else:
+            context = mean_context
+            attention_weights = uniform_weights
 
         lstm_input = torch.cat([embedding, context], dim=1)
         hidden, cell = model.decoder.lstm_cell(
@@ -261,8 +280,14 @@ def beam_search_decode(
     init_hidden = encoder_out.mean(dim=1)
     init_cell = torch.zeros_like(init_hidden)
 
-    # Precompute key projection W1(encoder_out) once per sequence
-    precomputed_W1 = model.decoder.attention.W1(encoder_out)
+    # Precompute key projection W1(encoder_out) once per sequence for additive attention
+    attn_type = getattr(model.decoder, "attention_type", "additive")
+    if attn_type == "additive":
+        precomputed_W1 = model.decoder.attention.W1(encoder_out)
+        mean_context = None
+    else:
+        precomputed_W1 = None
+        mean_context = encoder_out.mean(dim=1)
 
     live = [
         BeamHypothesis(
@@ -281,9 +306,12 @@ def beam_search_decode(
         for hyp in live:
             token = torch.tensor([hyp.last_token_id], dtype=torch.long, device=device)
             embed = model.decoder.embedding(token)
-            context, _ = model.decoder.attention(
-                encoder_out, hyp.hidden, precomputed_W1=precomputed_W1
-            )
+            if attn_type == "additive":
+                context, _ = model.decoder.attention(
+                    encoder_out, hyp.hidden, precomputed_W1=precomputed_W1
+                )
+            else:
+                context = mean_context
             lstm_input = torch.cat([embed, context], dim=1)
             next_hidden, next_cell = model.decoder.lstm_cell(
                 lstm_input, (hyp.hidden, hyp.cell)

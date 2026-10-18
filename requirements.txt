@@ -1,2 +1,4 @@
 pycocoevalcap
 pytest
+psutil
+matplotlib

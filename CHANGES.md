@@ -139,3 +139,44 @@ Auto-regressive caption models frequently suffer from premature `<eos>` emission
   - Validates grid deduplication: exactly 51 unique configurations with fixed parameters for $k=1$.
   - Validates test set config reading: `"eos_blocklist"` is properly read from JSON configurations.
 
+---
+
+## 4. Mean-Context Attention Ablation, Efficiency Profiling & Attention Visualization
+
+### 4.1 Mean-Context Ablation (No Learned Attention)
+- **Model Architecture ([`model.py`](file:///c:/dev/video/model.py))**:
+  - Parameterized `CaptionDecoder` and `VideoCaptionModel` with `attention_type` (`"additive"` default, or `"mean"`).
+  - For `attention_type == "mean"`, attention weights and projection parameters are eliminated entirely (`self.attention = None`).
+  - At every decoding step in `CaptionDecoder.forward`, the context vector is directly the spatial/temporal mean of encoder positions (`encoder_out.mean(dim=1)`), with uniform attention history ($1/N$) recorded for diagnostic compatibility.
+- **Decoding & Checkpoint Loading ([`generate_caption.py`](file:///c:/dev/video/generate_caption.py))**:
+  - Updated `load_model` to extract `attention_type` from `config` or top-level checkpoint dictionary, defaulting cleanly to `"additive"` for backward compatibility with all historical checkpoints.
+  - Updated `greedy_decode` and `beam_search_decode` to bypass key projection ($W_1$) and use mean context vectors when `attention_type == "mean"`.
+- **Training CLI & Serialization ([`train_spatiotemporal.py`](file:///c:/dev/video/train_spatiotemporal.py))**:
+  - Added `--attention-type {additive,mean}` CLI flag (default: `None`, falling back to `config.json` value or `"additive"` without mutating `config.json`).
+  - Propagated resolved `attention_type` into `VideoCaptionModel`, resolved config files (`results/{run_name}_config_resolved.json`), and checkpoint dictionaries (`best` and `last`).
+- **Queue Script Extension ([`run_queue.ps1`](file:///c:/dev/video/run_queue.ps1))**:
+  - Extended job specification to allow optional third field: `"enc:seed:attn"`.
+  - Sets run name to `${enc}_${attn}_v2_s${seed}` when `attn` is supplied and not `"additive"`, and passes `--attention-type $attn` to `train_spatiotemporal.py`.
+
+### 4.2 Efficiency Profiler ([`efficiency.py`](file:///c:/dev/video/efficiency.py))
+- Implemented standalone CLI profiling script:
+  - Trains/counts trainable parameters on `VideoCaptionModel`.
+  - Counts frozen VGG16 feature extractor parameters directly from torchvision (`vgg16(weights=None).features`: 14,714,688 parameters).
+  - Evaluates mean greedy and beam-5 latency per video across 100 test videos with 10 warm-up runs, strictly on CPU with thread configuration derived from `OMP_NUM_THREADS`.
+  - Asynchronously samples peak process memory (RSS) using `psutil`.
+  - Queries system CPU model string across Windows registry, Linux `/proc/cpuinfo`, and platform identifiers.
+  - Serializes report to `results/{checkpoint_stem}_efficiency.json`.
+
+### 4.3 Attention Visualization ([`visualize_attention.py`](file:///c:/dev/video/visualize_attention.py))
+- Implemented visualization tool accepting `--checkpoint PATH --video-ids ID [ID ...] --decoding greedy`:
+  - For temporal encoders (`temporal`, `temporal_bigru`, `spatiotemporal`): plots words $\times$ 8 frames attention heatmap with numerical cell annotations, saving PNGs to `results/attention/{run_name}/`.
+  - For `spatiotemporal_attention`:
+    - Marginalizes the 392 region weights over the $7 \times 7$ spatial grid to generate frame attention heatmaps.
+    - Reads frame indices from `data/features/vgg16_spatial/manifest.jsonl` and loads sampled video frames from `data/raw/YouTubeClips`.
+    - Overlays bicubic-upsampled $7 \times 7$ spatial attention heatmaps onto the 8 sampled video frames for each generated word.
+
+### 4.4 Dependencies & Testing
+- Updated [`requirements.txt`](file:///c:/dev/video/requirements.txt) to include `psutil` and `matplotlib`.
+- Added unit test suite [`tests/test_mean_attention_and_efficiency.py`](file:///c:/dev/video/tests/test_mean_attention_and_efficiency.py) covering mean-context decoder parameter isolation, uniform attention weights, greedy vs. beam-1 equivalence, checkpoint backward compatibility, VGG16 feature parameter counting, memory sampling, and visualization routines.
+
+

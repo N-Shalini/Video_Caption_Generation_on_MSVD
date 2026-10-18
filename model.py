@@ -194,7 +194,7 @@ AdditiveTemporalAttention = AdditiveAttention
 
 
 class CaptionDecoder(nn.Module):
-    """LSTMCell decoder with additive attention and optional scheduled sampling."""
+    """LSTMCell decoder with additive or mean attention and optional scheduled sampling."""
 
     def __init__(
         self,
@@ -203,16 +203,23 @@ class CaptionDecoder(nn.Module):
         hidden_dim=512,
         feature_dim=512,
         dropout=0.3,
+        attention_type="additive",
     ):
         super().__init__()
+        self.attention_type = attention_type
 
         self.embedding = nn.Embedding(vocab_size, embed_dim)
 
-        self.attention = AdditiveAttention(
-            feature_dim=feature_dim,
-            hidden_dim=hidden_dim,
-            attention_dim=hidden_dim,
-        )
+        if attention_type == "additive":
+            self.attention = AdditiveAttention(
+                feature_dim=feature_dim,
+                hidden_dim=hidden_dim,
+                attention_dim=hidden_dim,
+            )
+        elif attention_type == "mean":
+            self.attention = None
+        else:
+            raise ValueError(f"Unknown attention_type: {attention_type}")
 
         self.lstm_cell = nn.LSTMCell(
             embed_dim + feature_dim, hidden_dim
@@ -230,17 +237,32 @@ class CaptionDecoder(nn.Module):
         hidden = encoder_out.mean(dim=1)
         cell = torch.zeros_like(hidden)
 
-        # Precompute key projection W1(encoder_out) once per sequence
-        precomputed_W1 = self.attention.W1(encoder_out)
+        if self.attention_type == "additive":
+            precomputed_W1 = self.attention.W1(encoder_out)
+            mean_context = None
+            uniform_weights = None
+        else:
+            precomputed_W1 = None
+            mean_context = encoder_out.mean(dim=1)
+            uniform_weights = torch.full(
+                (encoder_out.size(0), encoder_out.size(1)),
+                1.0 / encoder_out.size(1),
+                device=encoder_out.device,
+                dtype=encoder_out.dtype,
+            )
 
         outputs = []
         attention_history = []
         prev_pred_embed = None
 
         for t in range(embeddings.size(1)):
-            context, attention_weights = self.attention(
-                encoder_out, hidden, precomputed_W1=precomputed_W1
-            )
+            if self.attention_type == "additive":
+                context, attention_weights = self.attention(
+                    encoder_out, hidden, precomputed_W1=precomputed_W1
+                )
+            else:
+                context = mean_context
+                attention_weights = uniform_weights
 
             # Scheduled sampling during training
             if (
@@ -287,9 +309,11 @@ class VideoCaptionModel(nn.Module):
         hidden_dim=512,
         dropout=0.3,
         encoder_type="temporal",
+        attention_type="additive",
     ):
         super().__init__()
         self.encoder_type = encoder_type
+        self.attention_type = attention_type
 
         if encoder_type in ("spatiotemporal", "temporal_bigru"):
             self.encoder = TemporalBiGRUFeatureEncoder(
@@ -318,6 +342,7 @@ class VideoCaptionModel(nn.Module):
             hidden_dim=hidden_dim,
             feature_dim=hidden_dim,
             dropout=dropout,
+            attention_type=attention_type,
         )
 
     def forward(self, video_features, captions, scheduled_sampling_prob=0.0):
@@ -328,3 +353,4 @@ class VideoCaptionModel(nn.Module):
         )
 
         return logits, attention_weights
+

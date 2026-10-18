@@ -160,6 +160,13 @@ def main():
         help="Encoder architecture type (overrides config).",
     )
     parser.add_argument(
+        "--attention-type",
+        type=str,
+        default=None,
+        choices=["additive", "mean"],
+        help="Attention mechanism type: 'additive' or 'mean' (overrides config).",
+    )
+    parser.add_argument(
         "--run-name",
         type=str,
         default=None,
@@ -241,6 +248,11 @@ def main():
 
     if args.encoder_type is not None:
         resolved_config["encoder_type"] = args.encoder_type
+
+    if args.attention_type is not None:
+        resolved_config["attention_type"] = args.attention_type
+    elif "attention_type" not in resolved_config:
+        resolved_config["attention_type"] = "additive"
 
     if args.run_name is not None:
         resolved_config["run_name"] = args.run_name
@@ -371,6 +383,7 @@ def main():
         hidden_dim=resolved_config["hidden_dim"],
         dropout=resolved_config["dropout"],
         encoder_type=encoder_type,
+        attention_type=resolved_config["attention_type"],
     ).to(device)
 
     criterion = nn.CrossEntropyLoss(
@@ -557,6 +570,7 @@ def main():
                 "config": resolved_config,
                 "vocab": train_dataset.vocab,
                 "architecture": encoder_type,
+                "attention_type": resolved_config["attention_type"],
             }
             torch.save(best_save_dict, best_checkpoint)
             print(f"  [*] Saved new best checkpoint based on {selection_metric}: {best_metric_val:.4f}")
@@ -580,6 +594,7 @@ def main():
             "config": resolved_config,
             "vocab": train_dataset.vocab,
             "architecture": encoder_type,
+            "attention_type": resolved_config["attention_type"],
         }
         torch.save(last_save_dict, last_checkpoint)
 
