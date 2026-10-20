@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from dataset import feature_dir_for, is_valid_feature_shape
 from model import VideoCaptionModel
 
 
@@ -527,17 +528,18 @@ def main():
             raise IndexError(f"Index must be between 0 and {len(records) - 1}.")
         record = records[args.index]
 
+    feature_type = config.get("feature_type", checkpoint.get("feature_type", "vgg16_spatial"))
+    feature_dir = feature_dir_for(feature_type)
     video_id = record["video_id"]
-    feature_path = FEATURE_DIR / f"{video_id}.npy"
+    feature_path = feature_dir / f"{video_id}.npy"
 
     if not feature_path.is_file():
         raise FileNotFoundError(f"Feature file not found: {feature_path}")
 
     features = np.load(feature_path, allow_pickle=False)
 
-    expected_shape = (8, 512, 7, 7)
-    if features.shape != expected_shape:
-        raise ValueError(f"Expected feature shape {expected_shape}, got {features.shape}")
+    if not is_valid_feature_shape(features.shape):
+        raise ValueError(f"Expected feature shape (8, 512, H, W) with H*W in {{1, 49}}, got {features.shape}")
 
     if features.dtype != np.float32:
         raise TypeError(f"Expected float32 features, got {features.dtype}")

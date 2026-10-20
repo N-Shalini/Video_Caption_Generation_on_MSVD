@@ -179,4 +179,37 @@ Auto-regressive caption models frequently suffer from premature `<eos>` emission
 - Updated [`requirements.txt`](file:///c:/dev/video/requirements.txt) to include `psutil` and `matplotlib`.
 - Added unit test suite [`tests/test_mean_attention_and_efficiency.py`](file:///c:/dev/video/tests/test_mean_attention_and_efficiency.py) covering mean-context decoder parameter isolation, uniform attention weights, greedy vs. beam-1 equivalence, checkpoint backward compatibility, VGG16 feature parameter counting, memory sampling, and visualization routines.
 
+---
+
+## 5. CLIP ViT-B/32 Feature Extraction & Representation Support
+
+### 5.1 CLIP Feature Extraction Script ([`extract_features_clip.py`](file:///c:/dev/video/extract_features_clip.py))
+- Implemented standalone feature extraction using CLIP ViT-B/32 image encoder:
+  - Prefers `open_clip_torch` with model `"ViT-B-32"` and `"openai"` pretrained weights, falling back gracefully to Hugging Face `transformers` (`"openai/clip-vit-base-patch32"`).
+  - Reuses exact `sampled_frame_indices` from [`data/features/vgg16_spatial/manifest.jsonl`](file:///c:/dev/video/data/features/vgg16_spatial/manifest.jsonl) ensuring identical temporal sampling across feature backbones.
+  - Decodes frames with OpenCV, converts BGR to RGB, applies CLIP preprocessing transforms, and runs inference in batches of up to 16 frames under `torch.inference_mode` on CPU (respecting `OMP_NUM_THREADS`).
+  - L2-normalises projected 512-d embeddings along the embedding dimension and saves float32 numpy arrays of shape `(8, 512, 1, 1)` into `data/features/clip_vitb32/{video_id}.npy`.
+  - Fully resumable extraction via `data/features/clip_vitb32/manifest.jsonl` (validating shape and finiteness on resume), logging errors to `errors.jsonl`, and supporting `--limit N`.
+
+### 5.2 Feature Type Plumbing & Shape Check Relaxation
+- **Path Resolution & Shape Rule ([`dataset.py`](file:///c:/dev/video/dataset.py))**:
+  - Implemented `feature_dir_for(feature_type)` mapping `"vgg16_spatial"` $\rightarrow$ `data/features/vgg16_spatial` and `"clip_vitb32"` $\rightarrow$ `data/features/clip_vitb32` (defaulting to `"vgg16_spatial"` when `None`).
+  - Relaxed shape validation via `is_valid_feature_shape(shape)` from strictly `(8, 512, 7, 7)` to `(8, 512, H, W)` where $H \times W \in \{1, 49\}$.
+  - Updated [`MSVDDataset`](file:///c:/dev/video/dataset.py#L52) to accept `feature_type` and/or `feature_dir`, ensuring backward compatibility with legacy calls.
+- **Training CLI & Checkpoint Serialization ([`train_spatiotemporal.py`](file:///c:/dev/video/train_spatiotemporal.py))**:
+  - Added `--feature-type {vgg16_spatial,clip_vitb32}` CLI flag (default: `None`, falling back to `config.json` value or `"vgg16_spatial"` without modifying `config.json`).
+  - Propagated resolved `feature_dir` to training/validation datasets and validation evaluation routines (`evaluate_val_greedy`).
+  - Recorded `feature_type` in `resolved_config` and checkpoint dictionaries (`best` and `last`).
+- **Inference & Evaluation Scripts**:
+  - Updated [`evaluate_test_set.py`](file:///c:/dev/video/evaluate_test_set.py), [`tune_decoding.py`](file:///c:/dev/video/tune_decoding.py), [`generate_caption.py`](file:///c:/dev/video/generate_caption.py), [`efficiency.py`](file:///c:/dev/video/efficiency.py), [`visualize_attention.py`](file:///c:/dev/video/visualize_attention.py), [`attention_stats.py`](file:///c:/dev/video/attention_stats.py), [`attention_positions.py`](file:///c:/dev/video/attention_positions.py), [`attention_dynamics.py`](file:///c:/dev/video/attention_dynamics.py), and [`ablate_eos_rule.py`](file:///c:/dev/video/ablate_eos_rule.py) to extract `feature_type` from checkpoint configurations (defaulting to `"vgg16_spatial"` when missing) and load features from the corresponding directory using the relaxed shape rule.
+
+### 5.3 Queue Runner Extension ([`run_queue.ps1`](file:///c:/dev/video/run_queue.ps1))
+- Extended job parsing to accept an optional fourth field: `"enc:seed:attn:feat"`.
+- Sets run name to `${enc}_${feat}_v2_s${seed}` when `feat` is provided and not `"vgg16_spatial"` (or `${enc}_${attn}_${feat}_v2_s${seed}` when a non-additive attention mechanism is also provided), passing `--feature-type $feat` to `train_spatiotemporal.py`.
+
+### 5.4 Dependencies & Testing
+- Updated [`requirements.txt`](file:///c:/dev/video/requirements.txt) to include `open_clip_torch`.
+- Added unit test suite [`tests/test_clip_features.py`](file:///c:/dev/video/tests/test_clip_features.py) verifying directory resolution, shape validation, dataset loading with `(8, 512, 1, 1)` features, encoder and decoder forward passes, extraction L2 normalization, and checkpoint configuration compatibility without triggering model downloads.
+
+
 

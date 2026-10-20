@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
+from dataset import feature_dir_for, is_valid_feature_shape
 from generate_caption import load_model, greedy_decode
 from model import reshape_attention_weights
 
@@ -286,16 +287,23 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     manifest = load_manifest()
 
-    print(f"Visualizing attention for run: {run_name} (encoder: {encoder_type})")
+    feature_type = config.get("feature_type", checkpoint.get("feature_type", "vgg16_spatial"))
+    feature_dir = feature_dir_for(feature_type)
+
+    print(f"Visualizing attention for run: {run_name} (encoder: {encoder_type}, features: {feature_type})")
     print(f"Saving visualizations to: {out_dir}")
 
     for video_id in args.video_ids:
-        feature_path = DEFAULT_FEATURE_DIR / f"{video_id}.npy"
+        feature_path = feature_dir / f"{video_id}.npy"
         if not feature_path.is_file():
             print(f"Warning: Feature file not found for {video_id} at {feature_path}. Skipping.")
             continue
 
         features = np.load(feature_path, allow_pickle=False)
+        if not is_valid_feature_shape(features.shape):
+            raise ValueError(
+                f"Unexpected feature shape for {video_id}: {features.shape}; expected (8, 512, H, W) with H*W in {{1, 49}}"
+            )
         caption, attention_history = greedy_decode(
             model=model,
             features=features,

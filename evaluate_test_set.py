@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from dataset import feature_dir_for, is_valid_feature_shape
 from generate_caption import load_model, greedy_decode, beam_search_decode, compute_eos_blocklist
 from metrics import evaluate_predictions, caption_statistics
 
@@ -243,20 +244,24 @@ def main():
 
     total_test = len(records)
     refs = {r["video_id"]: r["caption"] for r in records}
+    feature_type = config.get("feature_type", checkpoint.get("feature_type", "vgg16_spatial"))
+    feature_dir = feature_dir_for(feature_type)
 
     # Precompute test video encoder representations
     encoded_cache = {}
-    print(f"Precomputing encoder features for {total_test} test videos...")
+    print(f"Precomputing encoder features ({feature_type}) for {total_test} test videos...")
     start_time = time.time()
     with torch.inference_mode():
         for r in records:
             vid = r["video_id"]
-            feat_file = FEATURE_DIR / f"{vid}.npy"
+            feat_file = feature_dir / f"{vid}.npy"
             if not feat_file.is_file():
                 raise FileNotFoundError(f"Feature file not found: {feat_file}")
             feat_np = np.load(feat_file, allow_pickle=False)
-            if feat_np.shape != (8, 512, 7, 7):
-                raise ValueError(f"Unexpected feature shape for {vid}: {feat_np.shape}")
+            if not is_valid_feature_shape(feat_np.shape):
+                raise ValueError(
+                    f"Unexpected feature shape for {vid}: {feat_np.shape}; expected (8, 512, H, W) with H*W in {{1, 49}}"
+                )
             if feat_np.dtype != np.float32:
                 raise TypeError(f"Expected float32 features for {vid}, got {feat_np.dtype}")
             if not np.isfinite(feat_np).all():

@@ -8,6 +8,7 @@ import random
 import numpy as np
 import torch
 
+from dataset import feature_dir_for, is_valid_feature_shape
 from generate_caption import load_model, greedy_decode, beam_search_decode, compute_eos_blocklist
 from metrics import evaluate_predictions
 
@@ -51,8 +52,8 @@ def main():
     parser.add_argument(
         "--feature-dir",
         type=str,
-        default=str(FEATURE_DIR),
-        help="Directory with precomputed video features.",
+        default=None,
+        help="Directory with precomputed video features (defaults to directory from checkpoint feature_type).",
     )
     parser.add_argument(
         "--output",
@@ -150,9 +151,10 @@ def main():
     print("=" * 70)
 
     # Precompute encoder features for all validation videos
-    feature_dir = Path(args.feature_dir)
+    feature_type = config.get("feature_type", checkpoint.get("feature_type", "vgg16_spatial"))
+    feature_dir = Path(args.feature_dir) if args.feature_dir is not None else feature_dir_for(feature_type)
     encoded_cache = {}
-    print(f"Precomputing encoder representations for {val_count} videos...")
+    print(f"Precomputing encoder representations ({feature_type}) for {val_count} videos...")
     with torch.inference_mode():
         for r in records:
             vid = r["video_id"]
@@ -160,6 +162,10 @@ def main():
             if not feat_file.is_file():
                 raise FileNotFoundError(f"Feature file not found: {feat_file}")
             feat_np = np.load(feat_file, allow_pickle=False)
+            if not is_valid_feature_shape(feat_np.shape):
+                raise ValueError(
+                    f"Unexpected feature shape for {vid}: {feat_np.shape}; expected (8, 512, H, W) with H*W in {{1, 49}}"
+                )
             feat_t = torch.from_numpy(feat_np).float().unsqueeze(0).to(device)
             enc_out = model.encoder(feat_t)
             encoded_cache[vid] = enc_out

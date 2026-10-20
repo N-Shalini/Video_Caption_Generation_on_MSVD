@@ -17,6 +17,27 @@ VOCAB_PATH = ANNOTATION_DIR / "vocab.json"
 MAX_CAPTION_LENGTH = 30
 EXPECTED_FEATURE_SHAPE = (8, 512, 7, 7)
 
+
+def feature_dir_for(feature_type="vgg16_spatial"):
+    """Return feature directory Path for given feature_type."""
+    if feature_type in (None, "vgg16_spatial"):
+        return PROJECT_ROOT / "data" / "features" / "vgg16_spatial"
+    elif feature_type == "clip_vitb32":
+        return PROJECT_ROOT / "data" / "features" / "clip_vitb32"
+    else:
+        return PROJECT_ROOT / "data" / "features" / feature_type
+
+
+def is_valid_feature_shape(shape):
+    """Return True if shape matches (8, 512, H, W) with H*W in {1, 49}."""
+    return (
+        len(shape) == 4
+        and shape[0] == 8
+        and shape[1] == 512
+        and (shape[2] * shape[3]) in {1, 49}
+    )
+
+
 TOKEN_PATTERN = re.compile(r"\w+|[^\w\s]", re.UNICODE)
 
 
@@ -53,7 +74,8 @@ class MSVDDataset(Dataset):
         self,
         split,
         annotation_path=None,
-        feature_dir=FEATURE_DIR,
+        feature_dir=None,
+        feature_type=None,
         vocab_path=VOCAB_PATH,
         max_caption_length=MAX_CAPTION_LENGTH,
         captions_per_video=1,
@@ -76,7 +98,13 @@ class MSVDDataset(Dataset):
             annotation_path = ANNOTATION_DIR / f"msvd_{split}.json"
 
         self.split = split
-        self.feature_dir = Path(feature_dir)
+        if feature_dir is not None:
+            self.feature_dir = Path(feature_dir)
+        elif feature_type is not None:
+            self.feature_dir = feature_dir_for(feature_type)
+        else:
+            self.feature_dir = FEATURE_DIR
+        self.feature_type = feature_type
         self.max_caption_length = max_caption_length
         self.captions_per_video = int(captions_per_video)
         self.seed = int(seed)
@@ -212,10 +240,10 @@ class MSVDDataset(Dataset):
 
         features_np = np.load(feature_path, allow_pickle=False)
 
-        if features_np.shape != EXPECTED_FEATURE_SHAPE:
+        if not is_valid_feature_shape(features_np.shape):
             raise ValueError(
                 f"Unexpected feature shape for {video_id}: "
-                f"{features_np.shape}"
+                f"{features_np.shape}; expected (8, 512, H, W) with H*W in {{1, 49}}"
             )
 
         if features_np.dtype != np.float32:

@@ -2,3 +2,4 @@ pycocoevalcap
 pytest
 psutil
 matplotlib
+open_clip_torch

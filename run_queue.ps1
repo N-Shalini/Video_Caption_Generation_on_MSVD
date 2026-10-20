@@ -18,9 +18,16 @@ foreach ($item in $Jobs.Split(",")) {
   $parts = $item.Split(":")
   $enc   = $parts[0]
   $seed  = $parts[1]
-  $attn  = if ($parts.Length -gt 2) { $parts[2] } else { $null }
+  $attn  = if ($parts.Length -gt 2 -and $parts[2]) { $parts[2] } else { $null }
+  $feat  = if ($parts.Length -gt 3 -and $parts[3]) { $parts[3] } else { $null }
 
-  if ($attn -and $attn -ne "additive") {
+  if ($feat -and $feat -ne "vgg16_spatial") {
+    if ($attn -and $attn -ne "additive") {
+      $run = "${enc}_${attn}_${feat}_v2_s${seed}"
+    } else {
+      $run = "${enc}_${feat}_v2_s${seed}"
+    }
+  } elseif ($attn -and $attn -ne "additive") {
     $run = "${enc}_${attn}_v2_s${seed}"
   } else {
     $run = "${enc}_v2_s${seed}"
@@ -37,8 +44,9 @@ foreach ($item in $Jobs.Split(",")) {
     $extra = ""; $logBase = "results\logs\$run"
     if (Test-Path $last) { $extra = " --resume"; $logBase = "results\logs\${run}_resume" }
     $attnFlag = if ($attn) { " --attention-type $attn" } else { "" }
+    $featFlag = if ($feat) { " --feature-type $feat" } else { "" }
     Write-Host "$(Get-Date) training $run$extra"
-    Run-Step "train_spatiotemporal.py --encoder-type $enc --seed $seed --run-name $run$attnFlag$extra" $logBase
+    Run-Step "train_spatiotemporal.py --encoder-type $enc --seed $seed --run-name $run$attnFlag$featFlag$extra" $logBase
   }
 
   if ((Test-Path $best) -and -not (Test-Path $evalOut)) {

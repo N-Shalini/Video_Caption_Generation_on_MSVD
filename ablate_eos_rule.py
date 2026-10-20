@@ -7,7 +7,7 @@ import time
 import numpy as np
 import torch
 
-from dataset import tokenize
+from dataset import tokenize, feature_dir_for, is_valid_feature_shape
 from generate_caption import load_model, greedy_decode, beam_search_decode, compute_eos_blocklist
 from metrics import evaluate_predictions
 
@@ -36,7 +36,7 @@ def run_ablation(
     checkpoint_path,
     val_annotations_path=VAL_ANNOTATIONS,
     train_annotations_path=TRAIN_ANNOTATIONS,
-    feature_dir=FEATURE_DIR,
+    feature_dir=None,
     output_path=None,
     device_arg=None,
     seed=None,
@@ -81,7 +81,11 @@ def run_ablation(
     print("=" * 80)
 
     # Precompute validation features
-    feature_dir = Path(feature_dir)
+    if feature_dir is None:
+        feature_type = config.get("feature_type", checkpoint.get("feature_type", "vgg16_spatial"))
+        feature_dir = feature_dir_for(feature_type)
+    else:
+        feature_dir = Path(feature_dir)
     encoded_cache = {}
     print(f"Precomputing encoder features for {val_count} validation videos...")
     with torch.inference_mode():
@@ -91,6 +95,10 @@ def run_ablation(
             if not feat_file.is_file():
                 raise FileNotFoundError(f"Feature file not found: {feat_file}")
             feat_np = np.load(feat_file, allow_pickle=False)
+            if not is_valid_feature_shape(feat_np.shape):
+                raise ValueError(
+                    f"Unexpected feature shape for {vid}: {feat_np.shape}; expected (8, 512, H, W) with H*W in {{1, 49}}"
+                )
             feat_t = torch.from_numpy(feat_np).float().unsqueeze(0).to(device)
             encoded_cache[vid] = model.encoder(feat_t)
 

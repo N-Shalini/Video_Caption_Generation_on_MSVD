@@ -11,6 +11,7 @@ import numpy as np
 import psutil
 import torch
 
+from dataset import feature_dir_for, is_valid_feature_shape
 from generate_caption import load_model, greedy_decode, beam_search_decode
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -156,6 +157,15 @@ def main():
     sampler = ProcessMemorySampler(interval_sec=0.005)
     sampler.start()
 
+    # 1. Load model and count parameters
+    model, config, vocab, id_to_word, checkpoint = load_model(
+        device=device, checkpoint_path=checkpoint_path
+    )
+    model.eval()
+
+    feature_type = config.get("feature_type", checkpoint.get("feature_type", "vgg16_spatial"))
+    feature_dir = feature_dir_for(feature_type)
+
     # Load test annotations and sample features
     if not DEFAULT_ANNOTATIONS.is_file():
         raise FileNotFoundError(f"Test annotations not found at: {DEFAULT_ANNOTATIONS}")
@@ -167,17 +177,15 @@ def main():
     test_features = []
     for r in selected_records:
         vid = r["video_id"]
-        feat_path = DEFAULT_FEATURE_DIR / f"{vid}.npy"
+        feat_path = feature_dir / f"{vid}.npy"
         if not feat_path.is_file():
             raise FileNotFoundError(f"Feature file not found: {feat_path}")
         feat = np.load(feat_path, allow_pickle=False)
+        if not is_valid_feature_shape(feat.shape):
+            raise ValueError(
+                f"Unexpected feature shape for {vid}: {feat.shape}; expected (8, 512, H, W) with H*W in {{1, 49}}"
+            )
         test_features.append(feat)
-
-    # 1. Load model and count parameters
-    model, config, vocab, id_to_word, checkpoint = load_model(
-        device=device, checkpoint_path=checkpoint_path
-    )
-    model.eval()
 
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_model_params = sum(p.numel() for p in model.parameters())
@@ -246,6 +254,7 @@ def main():
     report = {
         "checkpoint": str(checkpoint_path),
         "checkpoint_stem": checkpoint_stem,
+        "feature_type": feature_type,
         "cpu_model": cpu_model,
         "omp_num_threads": omp_threads,
         "torch_num_threads": torch.get_num_threads(),

@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from dataset import MSVDDataset, collate_video_batch
+from dataset import MSVDDataset, collate_video_batch, feature_dir_for, is_valid_feature_shape
 from generate_caption import greedy_decode
 from metrics import evaluate_predictions
 from model import VideoCaptionModel
@@ -110,21 +110,33 @@ def run_epoch(
     }
 
 
-def evaluate_val_greedy(model, val_records, id_to_word, max_length, device, suppress_unk=True):
+def evaluate_val_greedy(
+    model,
+    val_records,
+    id_to_word,
+    max_length,
+    device,
+    suppress_unk=True,
+    feature_dir=None,
+):
     """Run greedy decoding on all validation videos and score with standard COCO metrics."""
+    if feature_dir is None:
+        feature_dir = FEATURE_DIR
     model.eval()
     hyps = {}
     refs = {}
 
     for record in val_records:
         video_id = record["video_id"]
-        feature_path = FEATURE_DIR / f"{video_id}.npy"
+        feature_path = feature_dir / f"{video_id}.npy"
         if not feature_path.is_file():
             raise FileNotFoundError(f"Missing features for {video_id}: {feature_path}")
 
         features = np.load(feature_path, allow_pickle=False)
-        if features.shape != (8, 512, 7, 7):
-            raise ValueError(f"Unexpected feature shape for {video_id}: {features.shape}")
+        if not is_valid_feature_shape(features.shape):
+            raise ValueError(
+                f"Unexpected feature shape for {video_id}: {features.shape}; expected (8, 512, H, W) with H*W in {{1, 49}}"
+            )
         if features.dtype != np.float32:
             raise TypeError(f"Expected float32 features for {video_id}, got {features.dtype}")
         if not np.isfinite(features).all():
@@ -165,6 +177,13 @@ def main():
         default=None,
         choices=["additive", "mean"],
         help="Attention mechanism type: 'additive' or 'mean' (overrides config).",
+    )
+    parser.add_argument(
+        "--feature-type",
+        type=str,
+        default=None,
+        choices=["vgg16_spatial", "clip_vitb32"],
+        help="Feature representation type (overrides config).",
     )
     parser.add_argument(
         "--run-name",
@@ -254,6 +273,11 @@ def main():
     elif "attention_type" not in resolved_config:
         resolved_config["attention_type"] = "additive"
 
+    if args.feature_type is not None:
+        resolved_config["feature_type"] = args.feature_type
+    elif "feature_type" not in resolved_config:
+        resolved_config["feature_type"] = "vgg16_spatial"
+
     if args.run_name is not None:
         resolved_config["run_name"] = args.run_name
     elif args.encoder_type is not None:
@@ -282,6 +306,8 @@ def main():
 
     run_name = resolved_config["run_name"]
     encoder_type = resolved_config["encoder_type"]
+    feature_type = resolved_config.get("feature_type", "vgg16_spatial")
+    feature_dir = feature_dir_for(feature_type)
     selection_metric = resolved_config.get("selection_metric", "cider").lower()
     seed = resolved_config.get("seed", 42)
 
@@ -325,7 +351,10 @@ def main():
 
     print("=" * 70)
     print(f"TRAINING VIDEO CAPTION MODEL: {run_name}")
-    print(f"Encoder: {encoder_type} | Device: {device} | Selection Metric: {selection_metric}")
+    print(
+        f"Encoder: {encoder_type} | Attention: {resolved_config['attention_type']} | "
+        f"Feature Type: {feature_type} | Device: {device} | Selection Metric: {selection_metric}"
+    )
     print(f"Epochs: {resolved_config['epochs']} | Batch size: {resolved_config['batch_size']}")
     print(f"Captions per video: {resolved_config['captions_per_video']} | LR: {resolved_config['learning_rate']}")
     print(f"Patience: {resolved_config['early_stopping_patience']}")
@@ -336,6 +365,7 @@ def main():
         "train",
         captions_per_video=resolved_config["captions_per_video"],
         seed=seed,
+        feature_dir=feature_dir,
     )
     if args.max_train_videos is not None:
         train_dataset.records = train_dataset.records[: args.max_train_videos]
@@ -347,6 +377,7 @@ def main():
         "val",
         captions_per_video=0,
         seed=seed,
+        feature_dir=feature_dir,
     )
     if args.max_val_videos is not None:
         val_loss_dataset.records = val_loss_dataset.records[: args.max_val_videos]
@@ -509,6 +540,7 @@ def main():
             max_length=resolved_config["max_caption_length"],
             device=device,
             suppress_unk=resolved_config.get("suppress_unk", True),
+            feature_dir=feature_dir,
         )
 
         val_loss = val_loss_metrics["loss"]
@@ -571,6 +603,7 @@ def main():
                 "vocab": train_dataset.vocab,
                 "architecture": encoder_type,
                 "attention_type": resolved_config["attention_type"],
+                "feature_type": resolved_config["feature_type"],
             }
             torch.save(best_save_dict, best_checkpoint)
             print(f"  [*] Saved new best checkpoint based on {selection_metric}: {best_metric_val:.4f}")
@@ -595,6 +628,7 @@ def main():
             "vocab": train_dataset.vocab,
             "architecture": encoder_type,
             "attention_type": resolved_config["attention_type"],
+            "feature_type": resolved_config["feature_type"],
         }
         torch.save(last_save_dict, last_checkpoint)
 
