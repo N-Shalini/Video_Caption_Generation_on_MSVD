@@ -1,4 +1,4 @@
-# Features, not architecture: lightweight video captioning on MSVD
+# Lightweight video captioning on MSVD
 
 A small, reproducible video-captioning code base (frozen frame features, a single-layer
 LSTM decoder with additive attention) used for a controlled study on the Microsoft Video
